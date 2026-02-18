@@ -1,0 +1,55 @@
+model_list:
+  - model_name: gemini-3-flash
+    litellm_params:
+      model: gemini/gemini-3-flash-preview
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: minimax-m2.5
+    litellm_params:
+      model: openrouter/minimax/minimax-m2.5
+      api_key: os.environ/OPENROUTER_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+
+litellm_settings:
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    password: os.environ/REDIS_AUTH
+
+  drop_params: true
+
+guardrails:
+  - guardrail_name: "presidio-pii"
+    litellm_params:
+      guardrail: presidio
+      mode: "pre_call"
+      default_on: true
+      output_parse_pii: true
+      presidio_language: "en"
+      presidio_filter_scope: both
+      presidio_score_thresholds:
+        ALL: 0.7
+      pii_entities_config:
+        PERSON: "MASK"
+        CREDIT_CARD: "MASK"
+        CRYPTO: "MASK"
+        EMAIL_ADDRESS: "MASK"
+        IBAN_CODE: "MASK"
+        IP_ADDRESS: "MASK"
+        LOCATION: "MASK"
+        MEDICAL_LICENSE: "MASK"
+        PHONE_NUMBER: "MASK"
+        URL: "MASK"
+        US_BANK_NUMBER: "MASK"
+        US_DRIVER_LICENSE: "MASK"
+        US_ITIN: "MASK"
+        US_PASSPORT: "MASK"
+        US_SSN: "MASK"
