@@ -26,12 +26,33 @@ litellm_settings:
 
   drop_params: true
 
+  default_internal_user_params:
+    user_role: "internal_user"
+    max_budget: 10.0
+    budget_duration: "30d"
+    models: ["gemini-3-flash", "minimax-m2.5"]
+    tpm_limit: 10000
+    rpm_limit: 60
+    allowed_routes: ["llm_api_routes", "mcp_routes"]
+
+  upperbound_key_generate_params:
+    max_budget: 10.0
+    budget_duration: "30d"
+    duration: "30d"
+    models: ["gemini-3-flash", "minimax-m2.5"]
+    tpm_limit: 10000
+    rpm_limit: 60
+
   mcp_aliases:
-    "deepwiki": "deepwiki_mcp_server"
+    "deepwiki": "deepwiki_mcp"
+    "linear": "linear_mcp"
 
 mcp_servers:
   deepwiki_mcp:
     url: "https://mcp.deepwiki.com/mcp"
+  linear_mcp:
+    url: "https://mcp.linear.app/mcp"
+    extra_headers: ["authorization"]
 
 guardrails:
   - guardrail_name: "presidio-pii"
