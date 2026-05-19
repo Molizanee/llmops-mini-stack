@@ -9,6 +9,7 @@
 #   - Redis             (cache / queue)       -> :6379
 #   - MinIO             (S3-compatible blob)  -> :9000 / :9090
 #   - MinIO Init        (bucket creation)
+#   - MCP Gateway       (OAuth shim)          -> :9100
 networks:
   llmops:
     driver: bridge
@@ -325,5 +326,40 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
+
+  mcp-gateway:
+    build: ./mcp-gateway
+    restart: unless-stopped
+    networks: [llmops]
+    ports:
+      - "9100:9100"
+    depends_on:
+      litellm:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      LITELLM_BASE_URL: http://litellm:4000
+      PUBLIC_BASE_URL: ${MCP_GATEWAY_PUBLIC_URL}
+      ALLOWED_REDIRECT_PREFIXES: ${MCP_ALLOWED_REDIRECT_PREFIXES:-https://claude.ai/,https://claude.com/,http://localhost,http://127.0.0.1}
+      REDIS_URL: redis://:${REDIS_AUTH}@redis:6379/2
+      MCP_BEARER_TTL: ${MCP_BEARER_TTL:-2592000}
+      LINEAR_OAUTH_CLIENT_ID: ${LINEAR_OAUTH_CLIENT_ID:-}
+      LINEAR_OAUTH_CLIENT_SECRET: ${LINEAR_OAUTH_CLIENT_SECRET:-}
+      LINEAR_REDIRECT_URI: ${LINEAR_REDIRECT_URI:-}
+      LINEAR_OAUTH_SCOPES: ${LINEAR_OAUTH_SCOPES:-read,write,issues:create,comments:create}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_HOST: http://langfuse-web:3000
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:9100/health')\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
