@@ -278,6 +278,7 @@ services:
 
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
+    pull_policy: always
     restart: unless-stopped
     networks: [llmops]
     ports:
