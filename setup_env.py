@@ -92,7 +92,6 @@ def main() -> None:
     nextauth_secret = generate_hex(32)
     langfuse_salt = generate_hex(16)
     langfuse_encryption_key = generate_hex(32)  # exactly 64 hex chars
-    webui_secret_key = generate_hex(32)
 
     langfuse_init_org_id = generate_uuid()
     langfuse_init_project_id = generate_uuid()
@@ -185,12 +184,6 @@ LANGFUSE_INIT_PROJECT_SECRET_KEY={langfuse_secret_key}
 LANGFUSE_INIT_USER_EMAIL={langfuse_admin_email}
 LANGFUSE_INIT_USER_NAME={langfuse_admin_name}
 LANGFUSE_INIT_USER_PASSWORD={langfuse_admin_password}
-
-# ---------------------------------------------------------------------------
-# Open WebUI
-# ---------------------------------------------------------------------------
-# Secret key for session management
-WEBUI_SECRET_KEY={webui_secret_key}
 """
 
     # --- Write .env file ---
@@ -204,16 +197,14 @@ WEBUI_SECRET_KEY={webui_secret_key}
     print()
     print("  Key values to remember:")
     print(f"    LiteLLM Master Key : {litellm_master_key}")
-    print(f"    Langfuse URL       : http://localhost:3001")
+    print(f"    Langfuse URL       : http://localhost:3000")
     print(f"    Langfuse Admin     : {langfuse_admin_email}")
     print(f"    Langfuse Password  : {langfuse_admin_password}")
-    print(f"    Open WebUI URL     : http://localhost:3000")
     print()
     print("  Next steps:")
     print("    1. docker compose up -d")
     print("    2. Wait ~60s for all services to start")
-    print("    3. Open http://localhost:3000 (Open WebUI)")
-    print("    4. Open http://localhost:3001 (Langfuse)")
+    print("    3. Open http://localhost:3000 (Langfuse)")
     print("    4. Open http://localhost:4000 (Litellm Proxy)")
     print("═══════════════════════════════════════════════════════════════════")
 

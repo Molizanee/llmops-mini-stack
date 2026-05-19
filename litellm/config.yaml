@@ -26,6 +26,13 @@ litellm_settings:
 
   drop_params: true
 
+  mcp_aliases:
+    "deepwiki": "deepwiki_mcp_server"
+
+mcp_servers:
+  deepwiki_mcp:
+    url: "https://mcp.deepwiki.com/mcp"
+
 guardrails:
   - guardrail_name: "presidio-pii"
     litellm_params:

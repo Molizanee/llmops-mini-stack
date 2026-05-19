@@ -16,7 +16,7 @@ Usar LLMs por plataformas de terceiros significa abrir mao do controle sobre cus
 ## Arquitetura
 
 ```
-Usuario -> Open WebUI (:3000) -> LiteLLM Proxy (:4000) -> Provedores LLM (Gemini, OpenRouter, etc.)
+Usuario -> LiteLLM Proxy (:4000) -> Provedores LLM (Gemini, OpenRouter, etc.)
                                        |
                                  Presidio (mascaramento PII)
                                        |
@@ -25,9 +25,8 @@ Usuario -> Open WebUI (:3000) -> LiteLLM Proxy (:4000) -> Provedores LLM (Gemini
 
 | Servico              | Porta | Finalidade                        |
 |----------------------|-------|-----------------------------------|
-| Open WebUI           | 3000  | Interface de chat                 |
 | LiteLLM Proxy        | 4000  | Gateway LLM, orcamento, roteamento|
-| Langfuse Web         | 3001  | UI e API de observabilidade       |
+| Langfuse Web         | 3000  | UI e API de observabilidade       |
 | Langfuse Worker      | 3030  | Processamento assincrono de traces|
 | Presidio Analyzer    | 5002  | Deteccao de PII                   |
 | Presidio Anonymizer  | 5001  | Mascaramento de PII               |
@@ -74,11 +73,10 @@ Aguarde cerca de 60 segundos para todos os servicos inicializarem e passarem nos
 
 ### 4. Acessar os servicos
 
-- **Open WebUI** (chat): http://localhost:3000
 - **LiteLLM Proxy** (admin): http://localhost:4000/ui
-- **Langfuse** (tracing): http://localhost:3001
+- **Langfuse** (tracing): http://localhost:3000
 
-No primeiro acesso ao Open WebUI, voce criara sua conta de administrador. Para o Langfuse, use as credenciais que voce informou durante o `setup_env.py`.
+Para o Langfuse, use as credenciais que voce informou durante o `setup_env.py`.
 
 ### Tracing
 
