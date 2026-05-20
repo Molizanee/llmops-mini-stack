@@ -69,6 +69,25 @@ LINEAR_SCOPES = os.environ.get(
 )
 LINEAR_ENABLED = bool(LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET and LINEAR_REDIRECT_URI)
 
+OAUTH_PROVIDERS: dict[str, dict[str, Any]] = {}
+if LINEAR_ENABLED:
+    OAUTH_PROVIDERS["linear"] = {
+        "authorize_url": LINEAR_AUTHORIZE_URL,
+        "client_id": LINEAR_CLIENT_ID,
+        "redirect_uri": LINEAR_REDIRECT_URI,
+        "scopes": LINEAR_SCOPES,
+        "extra_params": {"actor": "user"},
+    }
+
+# Mirrors LiteLLM's mcp_servers in litellm/config.yaml. Each alias maps to
+# its auth requirement. "oauth" entries point to an OAUTH_PROVIDERS key.
+# Adding a new MCP: add a row here. Adding a new OAuth provider: add a row
+# above + a callback handler below.
+MCP_AUTH_REGISTRY: dict[str, dict[str, str]] = {
+    "linear_mcp":   {"auth_type": "oauth", "provider": "linear"},
+    "deepwiki_mcp": {"auth_type": "none"},
+}
+
 ALLOWED_REDIRECT_PREFIXES = [
     p.strip()
     for p in os.environ.get(
@@ -272,12 +291,6 @@ _AUTHORIZE_HTML = """<!DOCTYPE html>
   .err{{background:#fee2e2;color:#991b1b;border-radius:8px;padding:10px 12px;
        font-size:13px;margin-bottom:14px;font-weight:600}}
   .err::before{{content:"⚠ ";margin-right:2px}}
-  .upstream{{margin-top:18px;padding:14px;background:#f1f5f9;border-radius:10px}}
-  .upstream-title{{font-size:13px;font-weight:600;color:#0f172a;margin-bottom:8px}}
-  .upstream-row{{display:flex;align-items:center;gap:10px;font-size:13px;color:#334155}}
-  .upstream-row input[type=checkbox]{{width:18px;height:18px;margin:0;cursor:pointer}}
-  .upstream-row label{{margin:0;font-weight:500;cursor:pointer}}
-  .upstream-row small{{display:block;color:#64748b;font-weight:400;font-size:12px;margin-top:2px}}
   @media (max-width:480px){{
     .card{{padding:24px}}
     h1{{font-size:18px}}
@@ -285,11 +298,11 @@ _AUTHORIZE_HTML = """<!DOCTYPE html>
 </style></head><body><div class="card">
 <div class="brand">Arara Tech · Grupo Guanabara</div>
 <h1>Autorizar acesso MCP</h1>
-<p class="sub">{client_name} está solicitando acesso ao seu gateway MCP do LiteLLM.
-Cole sua chave virtual do LiteLLM e, opcionalmente, conecte sua conta Linear
-para que ferramentas MCP do Linear operem como você.</p>
+<p class="sub">{client_name} está solicitando acesso ao gateway MCP do LiteLLM
+para <b>{mcp_label}</b>. Cole sua chave virtual do LiteLLM para autorizar.</p>
 <div class="meta">
   <b>Cliente:</b> {client_name}<br>
+  <b>MCP:</b> {mcp_label}<br>
   <b>Callback:</b> {redirect_uri}
 </div>
 {error_html}
@@ -300,6 +313,7 @@ para que ferramentas MCP do Linear operem como você.</p>
   <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
   <input type="hidden" name="state" value="{state}">
   <input type="hidden" name="scope" value="{scope}">
+  <input type="hidden" name="resource" value="{resource}">
   <label for="api_key">Chave virtual LiteLLM</label>
   <div class="input-wrap">
     <input id="api_key" name="api_key" type="password" autocomplete="off"
@@ -307,7 +321,6 @@ para que ferramentas MCP do Linear operem como você.</p>
     <button type="button" class="reveal" aria-label="Mostrar chave">mostrar</button>
   </div>
   <small class="hint">Formato: sk-... (chave virtual ou master key)</small>
-  {linear_block}
   <button type="submit" class="submit">Autorizar</button>
 </form>
 <p class="note">Chaves virtuais são emitidas no painel admin do LiteLLM, em Keys.
@@ -328,20 +341,6 @@ A master key também é aceita em laboratórios single-user.</p>
 </script>
 </body></html>"""
 
-_LINEAR_CHECKBOX = """
-  <div class="upstream">
-    <div class="upstream-title">Conectores upstream</div>
-    <div class="upstream-row">
-      <input type="checkbox" id="connect_linear" name="connect_linear" value="1" checked>
-      <label for="connect_linear">Conectar Linear (OAuth pessoal)
-        <small>Redireciona para login no Linear após autorizar.
-        Desmarque se este cliente só vai usar MCPs sem auth (ex.: DeepWiki).</small>
-      </label>
-    </div>
-  </div>
-"""
-
-
 def _render_authorize(
     client_id: str,
     client_name: str,
@@ -350,11 +349,12 @@ def _render_authorize(
     code_challenge_method: str,
     state: str,
     scope: str,
+    resource: str,
+    mcp_label: str,
     error: str = "",
 ) -> str:
     e = html.escape
     err_html = f'<div class="err">{e(error)}</div>' if error else ""
-    linear_block = _LINEAR_CHECKBOX if LINEAR_ENABLED else ""
     return _AUTHORIZE_HTML.format(
         client_id=e(client_id),
         client_name=e(client_name),
@@ -363,8 +363,9 @@ def _render_authorize(
         code_challenge_method=e(code_challenge_method),
         state=e(state),
         scope=e(scope),
+        resource=e(resource),
+        mcp_label=e(mcp_label),
         error_html=err_html,
-        linear_block=linear_block,
     )
 
 
@@ -378,6 +379,7 @@ async def authorize_get(request: Request) -> HTMLResponse:
     code_challenge_method = qp.get("code_challenge_method", "S256")
     state = qp.get("state", "")
     scope = qp.get("scope", "")
+    resource = qp.get("resource", "")
 
     if response_type != "code":
         raise HTTPException(400, "unsupported_response_type")
@@ -397,10 +399,14 @@ async def authorize_get(request: Request) -> HTMLResponse:
         if client.get("redirect_uris") and redirect_uri not in client["redirect_uris"]:
             raise HTTPException(400, "redirect_uri not in registration")
 
+    alias = _alias_from_resource(resource)
+    mcp_label = alias or "MCP genérico"
+
     return HTMLResponse(
         _render_authorize(
             client_id, client_name, redirect_uri,
             code_challenge, code_challenge_method, state, scope,
+            resource, mcp_label,
         )
     )
 
@@ -452,7 +458,7 @@ async def authorize_post(
     state: str = Form(""),
     scope: str = Form(""),
     api_key: str = Form(...),
-    connect_linear: str = Form(""),
+    resource: str = Form(""),
 ) -> Response:
     if code_challenge_method != "S256":
         raise HTTPException(400, "unsupported_code_challenge_method")
@@ -460,8 +466,10 @@ async def authorize_post(
     if not api_key.strip():
         raise HTTPException(400, "api_key required")
 
-    wants_linear = connect_linear == "1" and LINEAR_ENABLED
-    if not wants_linear:
+    alias = _alias_from_resource(resource)
+    entry = MCP_AUTH_REGISTRY.get(alias, {"auth_type": "none"})
+
+    if entry["auth_type"] == "none":
         return await _mint_auth_code(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -470,6 +478,11 @@ async def authorize_post(
             scope=scope,
             api_key=api_key.strip(),
         )
+
+    provider_id = entry.get("provider", "")
+    provider = OAUTH_PROVIDERS.get(provider_id)
+    if not provider:
+        raise HTTPException(400, f"oauth_provider_unavailable: {provider_id}")
 
     session_id = secrets.token_urlsafe(32)
     await r.setex(
@@ -483,20 +496,21 @@ async def authorize_post(
                 "state": state,
                 "scope": scope,
                 "api_key": api_key.strip(),
+                "provider": provider_id,
             }
         ),
     )
-    linear_params = {
-        "client_id": LINEAR_CLIENT_ID,
-        "redirect_uri": LINEAR_REDIRECT_URI,
+    params = {
+        "client_id": provider["client_id"],
+        "redirect_uri": provider["redirect_uri"],
         "response_type": "code",
-        "scope": LINEAR_SCOPES,
+        "scope": provider["scopes"],
         "state": session_id,
-        "actor": "user",
+        **provider.get("extra_params", {}),
     }
     return Response(
         status_code=302,
-        headers={"Location": f"{LINEAR_AUTHORIZE_URL}?{urlencode(linear_params)}"},
+        headers={"Location": f"{provider['authorize_url']}?{urlencode(params)}"},
     )
 
 
@@ -514,6 +528,9 @@ async def linear_callback(
         raise HTTPException(400, "session_expired")
     await r.delete(K_SESSION + state)
     sess = json.loads(raw)
+
+    if sess.get("provider") != "linear":
+        raise HTTPException(400, f"provider_mismatch: {sess.get('provider')!r}")
 
     tok_resp = await linear_client.post(
         LINEAR_TOKEN_URL,
@@ -740,14 +757,28 @@ def _server_from_path(path: str) -> str:
     return p.split("/", 1)[0] or "mcp_root"
 
 
-def _span_name(parsed: dict[str, Any]) -> str:
+def _alias_from_resource(resource: str) -> str:
+    """Pull the last path segment of resource=https://host/mcp/<alias>.
+
+    Empty/malformed/unknown resources fall through to no-auth at the caller.
+    """
+    if not resource:
+        return ""
+    try:
+        path = urlparse(resource).path
+    except ValueError:
+        return ""
+    return path.rstrip("/").rsplit("/", 1)[-1] if path else ""
+
+
+def _span_name(parsed: dict[str, Any], server: str) -> str:
     method = parsed.get("method")
     tool = parsed.get("tool_name")
     if method == "tools/call" and tool:
-        return f"mcp.tools/call.{tool}"
+        return f"{server}/{tool}"
     if method:
-        return f"mcp.{method}"
-    return "mcp.request"
+        return f"{server}/{method}"
+    return f"{server}/request"
 
 
 def _start_mcp_span(
@@ -921,7 +952,7 @@ async def mcp_proxy(path: str, request: Request) -> Response:
     api_key = (bind or {}).get("api_key", "")
     user_id, session_id = _user_ids(bearer, api_key)
     span = _start_mcp_span(
-        name=_span_name(parsed),
+        name=_span_name(parsed, server),
         body=body,
         parsed=parsed,
         user_id=user_id,

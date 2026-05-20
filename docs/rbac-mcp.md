@@ -28,10 +28,22 @@
 
 ## 1. Visão geral
 
-O stack expõe ferramentas MCP (Model Context Protocol) a clientes externos (Claude Desktop, claude.ai) através de **um único endpoint OAuth 2.1** — o serviço `mcp-gateway` (porta `:9100`). Internamente, o gateway compõe duas identidades distintas em um único bearer opaco:
+O stack expõe ferramentas MCP (Model Context Protocol) a clientes externos através de **um único endpoint OAuth 2.1** — o serviço `mcp-gateway` (porta `:9100`). Internamente, o gateway compõe duas identidades distintas em um único bearer opaco:
 
 - **Identidade da plataforma**: virtual key emitida pelo LiteLLM (`sk-...`). Define quais MCPs e quais modelos LLM o usuário tem direito de acessar.
-- **Identidade pessoal**: token OAuth do Linear (`actor=user`). Permite que ações no Linear sejam executadas COMO O USUÁRIO humano que autorizou.
+- **Identidade pessoal**: token OAuth do provider upstream (ex.: Linear com `actor=user`). Permite que ações no upstream sejam executadas COMO O USUÁRIO humano que autorizou.
+
+### MCP-client agnóstico
+
+O conjunto `mcp-gateway` + `LiteLLM` + `Langfuse` não tem dependência de cliente específico. Qualquer aplicação que fale o protocolo MCP padrão (Streamable HTTP + OAuth 2.1 conforme [modelcontextprotocol.io](https://modelcontextprotocol.io)) consegue conectar:
+
+- **Claude Desktop** e **claude.ai** (web/extensão) — testados no laboratório.
+- **ChatGPT** (custom connectors / GPTs que suportam MCP).
+- **Cursor**, **Windsurf**, **Zed**, **VS Code com extensão MCP** e demais IDEs com cliente MCP nativo.
+- **Agentes** próprios construídos com `mcp` SDK (Python, TypeScript, Go) — basta apontar para o endpoint do gateway e seguir o fluxo Discovery → DCR → Authorize → Token descrito em §6.
+- **Frameworks de orquestração** (LangChain, LlamaIndex, AutoGen, CrewAI, etc.) com adapter MCP.
+
+O gateway só fala protocolo: `/.well-known/oauth-authorization-server` (RFC 8414), `/.well-known/oauth-protected-resource` (RFC 9728), `/register` (RFC 7591), authorize + PKCE S256 (RFC 7636), Bearer token. Tudo padrão. Trocar de cliente significa apontar o cliente novo para o mesmo `PUBLIC_BASE_URL` e refazer o consent. O Langfuse continua observando todas as chamadas (cada cliente vira um span com `trace.user_id` distinto via `bearer[:16]`).
 
 ### Diagrama
 
@@ -95,9 +107,9 @@ LiteLLM v1.85.0 fala MCP nativamente como gateway de servidor → servidor, mas 
 O `mcp-gateway` implementa esse contrato. Internamente, ele:
 
 1. Pede ao usuário a virtual key LiteLLM na tela de consent.
-2. Opcionalmente, redireciona ao Linear para coletar o OAuth pessoal.
-3. Cria um **compound bearer** (`cmp_*`) que amarra os dois.
-4. A cada chamada `/mcp/*`, expande o bearer em headers que o LiteLLM (ou o servidor MCP upstream) entende.
+2. Identifica o MCP solicitado pelo parâmetro `resource` da URL de authorize (`https://<gateway>/mcp/<alias>`) e consulta o `MCP_AUTH_REGISTRY` (ver §5.2). Se `auth_type=oauth`, redireciona automaticamente ao provider configurado (ex.: Linear); se `auth_type=none`, emite o code direto sem segundo hop.
+3. Cria um **compound bearer** (`cmp_*`) que amarra a virtual key ao token OAuth pessoal (quando houver).
+4. A cada chamada `/mcp/*`, expande o bearer em headers que o LiteLLM (ou o servidor MCP upstream) entende, e emite um span Langfuse `<mcp_name>/<tool_ou_method>` por requisição.
 
 ---
 
@@ -240,7 +252,7 @@ curl -s http://litellm:4000/v1/mcp/server \
   -H "Authorization: Bearer sk-virtual-key-abc123"
 ```
 
-Resposta típica (forma pode variar conforme a versão do LiteLLM — o shim trata as variações; ver §5.9):
+Resposta típica (forma pode variar conforme a versão do LiteLLM — o shim trata as variações; ver §5.10):
 
 ```json
 {
@@ -254,7 +266,7 @@ Resposta típica (forma pode variar conforme a versão do LiteLLM — o shim tra
 }
 ```
 
-Esta é a fonte de verdade que o shim consulta antes de proxar `/mcp/linear` (ver §5.8). É o ponto de enforcement do RBAC por MCP.
+Esta é a fonte de verdade que o shim consulta antes de proxar `/mcp/linear` (ver §5.9). É o ponto de enforcement do RBAC por MCP.
 
 ### 3.3 Declaração dos MCPs no YAML
 
@@ -270,7 +282,7 @@ mcp_servers:
 ```
 
 - `deepwiki_mcp` é público, não exige nenhuma credencial — o LiteLLM repassa a chamada sem header `authorization`.
-- `linear_mcp` declara `extra_headers: ["authorization"]`. Isso diz ao LiteLLM: "se o cliente enviar um header `authorization`, repasse-o ao upstream do Linear como `authorization`". É como o token OAuth pessoal chega ao Linear quando a chamada passa pelo LiteLLM (cenário que, por enquanto, está bypassado pelo workaround do issue #26700 — ver §5.8 e §11).
+- `linear_mcp` declara `extra_headers: ["authorization"]`. Isso diz ao LiteLLM: "se o cliente enviar um header `authorization`, repasse-o ao upstream do Linear como `authorization`". É como o token OAuth pessoal chega ao Linear quando a chamada passa pelo LiteLLM (cenário que, por enquanto, está bypassado pelo workaround do issue #26700 — ver §5.9 e §11).
 
 ### 3.4 Aliases
 
@@ -314,35 +326,25 @@ Resposta inclui `key` (`sk-...`). Esta key:
 
 ---
 
-## 4. Camada 3 — OAuth pessoal upstream (Linear)
+## 4. Camada 3 — OAuth pessoal upstream
+
+Esta camada se aplica a qualquer MCP marcado como `auth_type=oauth` no `MCP_AUTH_REGISTRY` (§5.2). Hoje, o único provider concretamente configurado é o Linear, e os exemplos abaixo usam Linear como caso ilustrativo. A mesma estrutura suporta Notion, Slack, GitHub, Jira, etc. — basta adicionar uma entrada em `OAUTH_PROVIDERS`, um alias em `MCP_AUTH_REGISTRY` e um handler de callback (ver §11.3 para o checklist).
 
 ### 4.1 Por que é necessário
 
-O LiteLLM, sozinho, autentica a key da plataforma — mas não tem como saber qual usuário humano está por trás daquela key. Para MCPs onde ações geram efeitos rastreáveis no sistema upstream (criar issue, postar comentário, etc.), o sistema upstream precisa autorizar a operação **como o usuário**, não como um bot da organização.
+O LiteLLM, sozinho, autentica a key da plataforma — mas não tem como saber qual usuário humano está por trás daquela key. Para MCPs onde ações geram efeitos rastreáveis no sistema upstream (criar issue no Linear, postar mensagem no Slack, editar página no Notion, abrir PR no GitHub, etc.), o sistema upstream precisa autorizar a operação **como o usuário**, não como um bot da organização.
 
-O Linear, por exemplo, suporta dois modos de OAuth:
+Vários providers expõem essa semântica via parâmetros extras no authorize endpoint. Exemplos:
 
-- `actor=app`: ações registradas como "criado por <App OAuth>".
-- `actor=user`: ações registradas como "criado por Alice".
+- **Linear**: `actor=user` (ações ficam "criado por Alice", não "criado por <App OAuth>"). Default no shim — declarado em `OAUTH_PROVIDERS["linear"]["extra_params"]`.
+- **Slack**: distinção entre `user_scope` e `scope` no OAuth — `user_scope` produz tokens que agem como o usuário; `scope` produz tokens de bot.
+- **Google / Microsoft**: `prompt=consent` força reconfirmação, e o token herda a identidade do usuário logado.
 
-O shim força `actor=user` no momento do redirect (`mcp-gateway/app.py:474`):
-
-```python
-linear_params = {
-    "client_id": LINEAR_CLIENT_ID,
-    "redirect_uri": LINEAR_REDIRECT_URI,
-    "response_type": "code",
-    "scope": LINEAR_SCOPES,
-    "state": session_id,
-    "actor": "user",
-}
-```
-
-Isso garante que cada usuário tem seu próprio `linear_access` armazenado individualmente no Redis, vinculado à sua virtual key.
+A flexibilidade vive em `provider["extra_params"]` — cada provider declara o que precisa para ações como-usuário.
 
 ### 4.2 Armazenamento
 
-Após o callback do Linear, o shim persiste o binding em Redis (DB 2, segregado do cache do LiteLLM que usa DB 0) sob a chave `mcp:bearer:cmp_<random>`:
+Após o callback OAuth (`/v1/linear/callback` no caso atual), o shim persiste o binding em Redis (DB 2, segregado do cache do LiteLLM que usa DB 0) sob a chave `mcp:bearer:cmp_<random>`:
 
 ```json
 {
@@ -354,20 +356,21 @@ Após o callback do Linear, o shim persiste o binding em Redis (DB 2, segregado 
 ```
 
 - TTL Redis: `BEARER_TTL` (default 30 dias = 2592000s).
-- A key Redis é o **valor opaco** que o cliente MCP recebe como `access_token`. O cliente nunca vê a virtual key nem o token do Linear.
+- A key Redis é o **valor opaco** que o cliente MCP recebe como `access_token`. O cliente nunca vê a virtual key nem o token do upstream.
+- Para um futuro provider (ex.: Notion), espera-se acrescentar campos `notion_access`/`notion_refresh`/`notion_exp` ao mesmo JSON. A refatoração futura sugerida em §11.3 normaliza isso para `oauth.<provider>.{access,refresh,exp}`.
 
 ### 4.3 Auto-refresh
 
-Linear emite tokens com `expires_in=3600` (1h) ou similar. Para evitar 401s mid-call, o proxy `/mcp/*` verifica antes de cada request:
+Providers OAuth emitem `access_token` com TTL curto (Linear: ~1h; Slack: indefinido com refresh opcional; Notion: ~1h). Para evitar 401s mid-call, o proxy `/mcp/*` verifica antes de cada request:
 
 ```python
 if bind.get("linear_exp") and bind["linear_exp"] < time.time() + REFRESH_LEAD:
     bind = await _refresh_linear(bearer, bind)
 ```
 
-`REFRESH_LEAD = 60s` (constante em `app.py:79`). Se faltam menos de 60s para expirar, o shim chama `POST {LINEAR_TOKEN_URL}` com `grant_type=refresh_token` e atualiza o binding no Redis **mantendo a mesma chave externa** `cmp_*`. O cliente nunca percebe a rotação interna.
+`REFRESH_LEAD = 60s` (constante em `app.py`). Se faltam menos de 60s para expirar, o shim chama `POST {LINEAR_TOKEN_URL}` com `grant_type=refresh_token` e atualiza o binding no Redis **mantendo a mesma chave externa** `cmp_*`. O cliente nunca percebe a rotação interna.
 
-Linear rotaciona o `refresh_token` a cada uso — `_refresh_linear` salva o novo `refresh_token` se vier, ou mantém o atual (`tok.get("refresh_token", rt)`, `app.py:655`).
+Linear rotaciona o `refresh_token` a cada uso — `_refresh_linear` salva o novo `refresh_token` se vier, ou mantém o atual. Outros providers podem ou não rotacionar; cada `_refresh_<x>` precisa lidar com a política do upstream específico.
 
 Se o refresh falhar (refresh_token revogado, etc.), o binding é deletado e o cliente recebe 401 — ele precisa refazer o fluxo OAuth completo.
 
@@ -411,7 +414,53 @@ return {
 }
 ```
 
-### 5.2 Dynamic Client Registration `/register` (linhas 186-211)
+### 5.2 Registry de auth por alias e providers OAuth
+
+O dispatch automático introduzido em [`add-mcp-langfuse-traces`](#) repousa em duas tabelas declaradas próximas do bloco de env Linear em `mcp-gateway/app.py`:
+
+```python
+OAUTH_PROVIDERS: dict[str, dict[str, Any]] = {}
+if LINEAR_ENABLED:
+    OAUTH_PROVIDERS["linear"] = {
+        "authorize_url": LINEAR_AUTHORIZE_URL,
+        "client_id": LINEAR_CLIENT_ID,
+        "redirect_uri": LINEAR_REDIRECT_URI,
+        "scopes": LINEAR_SCOPES,
+        "extra_params": {"actor": "user"},
+    }
+
+# Mirrors LiteLLM's mcp_servers em litellm/config.yaml.
+MCP_AUTH_REGISTRY: dict[str, dict[str, str]] = {
+    "linear_mcp":   {"auth_type": "oauth", "provider": "linear"},
+    "deepwiki_mcp": {"auth_type": "none"},
+}
+```
+
+Semântica:
+
+- **`MCP_AUTH_REGISTRY`** — mapeia alias do MCP (mesmo nome usado em `litellm/config.yaml → mcp_servers`) para `auth_type`. Valor `"none"` significa "apenas virtual key basta"; `"oauth"` significa "redirecionar a um provider antes de emitir o code".
+- **`OAUTH_PROVIDERS`** — mapeia `provider` (`"linear"`) para os parâmetros do authorize-endpoint upstream. Decoupla alias do provider, então um futuro `linear_admin_mcp` poderia reusar `provider="linear"` sem duplicar config.
+- **Alias desconhecido OU `resource` ausente** → fallback `auth_type="none"` (sem segundo hop). Mantém compat com clientes legados que não enviam `resource` e evita quebrar se LiteLLM ganhar um novo MCP antes do registry ser atualizado.
+- **`auth_type=oauth` com provider faltando** (`LINEAR_OAUTH_*` não definidos) → HTTP 400 `oauth_provider_unavailable: <provider>`. Falha alta para evitar consent mal-configurado.
+
+Helper que extrai o alias:
+
+```python
+def _alias_from_resource(resource: str) -> str:
+    """Pull the last path segment of resource=https://host/mcp/<alias>."""
+    if not resource:
+        return ""
+    try:
+        path = urlparse(resource).path
+    except ValueError:
+        return ""
+    return path.rstrip("/").rsplit("/", 1)[-1] if path else ""
+```
+
+**Adicionar um novo MCP no-auth**: uma linha em `MCP_AUTH_REGISTRY`.
+**Adicionar um novo MCP com OAuth pessoal**: uma linha em `OAUTH_PROVIDERS` + uma linha em `MCP_AUTH_REGISTRY` apontando para ele + handler de callback dedicado (hoje só existe `/v1/linear/callback`).
+
+### 5.3 Dynamic Client Registration `/register` (linhas 186-211)
 
 RFC 7591. Aceita um POST JSON com `redirect_uris` e `client_name`:
 
@@ -431,80 +480,90 @@ async def register(request: Request) -> JSONResponse:
 - Cada `redirect_uri` é validado por `_validate_redirect_uri` (§9 Modelo de Ameaça).
 - `CLIENTS` é um `dict` in-memory. Sobrevive somente até o restart do container. Mitigação: clientes legítimos (Claude Desktop) simplesmente refazem o registration na próxima sessão, custo zero para o usuário.
 
-### 5.3 Authorize GET (linhas 350-384)
+### 5.4 Authorize GET
 
 ```python
 @app.get("/v1/mcp/oauth/authorize")
 async def authorize_get(request: Request) -> HTMLResponse:
-    # Validações:
-    if response_type != "code":             # só authorization code flow
-    if code_challenge_method != "S256":     # PKCE S256 obrigatório
-    if not code_challenge:                  # PKCE obrigatório
-    if not redirect_uri:                    # redirect obrigatório
-    _validate_redirect_uri(redirect_uri)    # allow-list de prefixos
+    qp = request.query_params
+    client_id = qp.get("client_id", "")
+    redirect_uri = qp.get("redirect_uri", "")
+    response_type = qp.get("response_type", "code")
+    code_challenge = qp.get("code_challenge", "")
+    code_challenge_method = qp.get("code_challenge_method", "S256")
+    state = qp.get("state", "")
+    scope = qp.get("scope", "")
+    resource = qp.get("resource", "")            # NEW
 
-    client = CLIENTS.get(client_id)
-    if client and client.get("redirect_uris") and redirect_uri not in client["redirect_uris"]:
-        raise HTTPException(400, "redirect_uri not in registration")
+    # Validações: response_type=code, PKCE S256 obrigatório, redirect_uri validado.
+    ...
 
-    return HTMLResponse(_render_authorize(...))
+    alias = _alias_from_resource(resource)
+    mcp_label = alias or "MCP genérico"
+    return HTMLResponse(_render_authorize(..., resource, mcp_label))
 ```
 
-A página HTML renderizada (`_AUTHORIZE_HTML`, linhas 214-308) pede:
+Mudanças em relação à versão original:
+
+- **Lê `resource`** da query string. Claude.ai envia `resource=https://<gateway>/mcp/<alias>` em todo authorize. `_alias_from_resource` extrai o último segmento do path. Empty/garbage → string vazia → fallback `auth_type=none` no POST.
+- **`mcp_label`** é exibido no consent para o usuário saber qual MCP está sendo autorizado.
+
+A página HTML renderizada (`_AUTHORIZE_HTML`) pede apenas:
 
 - Virtual key LiteLLM (`sk-...`).
-- Checkbox **opcional** "Conectar Linear" (exibido somente se `LINEAR_ENABLED`, i.e. se `LINEAR_OAUTH_CLIENT_ID`/`_SECRET`/`REDIRECT_URI` estiverem todos definidos no `.env`).
+- Um hidden field `resource` que o POST usará para dispatch.
+
+**Não há mais checkbox "Conectar Linear"**. A decisão de redirecionar ao Linear (ou a qualquer outro provider OAuth) vem do `MCP_AUTH_REGISTRY` em função do alias — automática, não negociável pelo usuário.
 
 Branding: "Arara Tech · Grupo Guanabara". Texto em pt-BR.
 
-### 5.4 Authorize POST (linhas 425-479)
+### 5.5 Authorize POST
 
-Dois caminhos exclusivos:
-
-**A. Sem Linear** (checkbox desmarcado, ou Linear desabilitado):
+O dispatch é dirigido pelo registry, não por checkbox:
 
 ```python
-return await _mint_auth_code(
-    client_id=client_id,
-    redirect_uri=redirect_uri,
-    code_challenge=code_challenge,
-    state=state,
-    scope=scope,
-    api_key=api_key.strip(),
-)
+async def authorize_post(..., api_key: str = Form(...), resource: str = Form("")) -> Response:
+    ...
+    alias = _alias_from_resource(resource)
+    entry = MCP_AUTH_REGISTRY.get(alias, {"auth_type": "none"})
+
+    if entry["auth_type"] == "none":
+        return await _mint_auth_code(...)        # caminho A
+
+    provider_id = entry["provider"]
+    provider = OAUTH_PROVIDERS.get(provider_id)
+    if not provider:
+        raise HTTPException(400, f"oauth_provider_unavailable: {provider_id}")
+
+    session_id = secrets.token_urlsafe(32)
+    await r.setex(K_SESSION + session_id, SESSION_TTL, json.dumps({
+        ..., "api_key": api_key.strip(), "provider": provider_id,
+    }))
+    params = {
+        "client_id": provider["client_id"],
+        "redirect_uri": provider["redirect_uri"],
+        "response_type": "code",
+        "scope": provider["scopes"],
+        "state": session_id,
+        **provider.get("extra_params", {}),
+    }
+    return Response(status_code=302,
+                    headers={"Location": f"{provider['authorize_url']}?{urlencode(params)}"})
 ```
 
-`_mint_auth_code` grava o code em Redis sob `mcp:code:<code>` (TTL 300s) e retorna `302 Location: <redirect_uri>?code=...&state=...`.
+Dois caminhos exclusivos, determinados pelo registry:
 
-**B. Com Linear** (checkbox marcado, Linear habilitado):
+**A. `auth_type=none`** (alias desconhecido, `resource` ausente, ou MCP marcado como no-auth — ex.: `deepwiki_mcp`):
 
-```python
-session_id = secrets.token_urlsafe(32)
-await r.setex(K_SESSION + session_id, SESSION_TTL,
-              json.dumps({
-                  "client_id": client_id,
-                  "redirect_uri": redirect_uri,
-                  "code_challenge": code_challenge,
-                  "state": state,
-                  "scope": scope,
-                  "api_key": api_key.strip(),
-              }))
-linear_params = {
-    "client_id": LINEAR_CLIENT_ID,
-    "redirect_uri": LINEAR_REDIRECT_URI,
-    "response_type": "code",
-    "scope": LINEAR_SCOPES,
-    "state": session_id,
-    "actor": "user",
-}
-return Response(status_code=302,
-                headers={"Location": f"{LINEAR_AUTHORIZE_URL}?{urlencode(linear_params)}"})
-```
+`_mint_auth_code` grava o code em Redis sob `mcp:code:<code>` (TTL 300s) e retorna `302 Location: <redirect_uri>?code=...&state=...`. Sem segundo hop.
 
-- A sessão Redis (`mcp:session:<id>`, TTL `SESSION_TTL=600s`) guarda o contexto OAuth do cliente original (incluindo `api_key`).
-- O `state` enviado ao Linear é o `session_id` — não confundir com o `state` original do cliente, que vai dentro do payload da sessão e será reanexado quando o code do shim for emitido.
+**B. `auth_type=oauth`** (ex.: `linear_mcp` → provider `linear`):
 
-### 5.5 Callback Linear `/v1/linear/callback` (linhas 482-524)
+- A sessão Redis (`mcp:session:<id>`, TTL `SESSION_TTL=600s`) guarda o contexto OAuth do cliente original **mais o `provider`** (campo novo). O callback usa esse campo para validar que está tratando o provider certo.
+- O `state` enviado ao provider é o `session_id` — não confundir com o `state` original do cliente, que vai dentro do payload da sessão e será reanexado quando o code do shim for emitido.
+- `provider["extra_params"]` carrega flags específicas. Para Linear, `{"actor": "user"}` força que ações no upstream sejam registradas como o usuário humano (não como app OAuth).
+
+### 5.6 Callback Linear `/v1/linear/callback`
 
 ```python
 @app.get("/v1/linear/callback")
@@ -514,6 +573,9 @@ async def linear_callback(code: str = "", state: str = "", ...):
         raise HTTPException(400, "session_expired")
     await r.delete(K_SESSION + state)
     sess = json.loads(raw)
+
+    if sess.get("provider") != "linear":
+        raise HTTPException(400, f"provider_mismatch: {sess.get('provider')!r}")
 
     tok_resp = await linear_client.post(
         LINEAR_TOKEN_URL,
@@ -543,7 +605,9 @@ async def linear_callback(code: str = "", state: str = "", ...):
 
 A sessão é deletada antes do mint (`r.delete(K_SESSION + state)`) — não há replay possível. O code resultante já carrega os tokens do Linear.
 
-### 5.6 Token endpoint `/v1/mcp/oauth/token` (linhas 527-575)
+O check `sess["provider"] != "linear"` falha alto se o callback `/v1/linear/callback` for invocado com uma sessão originada de outro provider (cenário futuro quando o registry tiver mais entradas com `auth_type=oauth`). Hoje serve de sentinela para detectar erros de dispatch — quando um novo provider for adicionado, precisará de seu próprio handler de callback.
+
+### 5.7 Token endpoint `/v1/mcp/oauth/token`
 
 ```python
 @app.post("/v1/mcp/oauth/token")
@@ -588,7 +652,7 @@ Bearer emitido: `cmp_<48 bytes urlsafe base64>` (`token_urlsafe(48)` → ~64 cha
 
 `TOKEN_NO_CACHE = {"Cache-Control": "no-store", "Pragma": "no-cache"}` previne caches intermediários de guardarem o bearer.
 
-### 5.7 Revoke `/v1/mcp/oauth/revoke` (linhas 578-598)
+### 5.8 Revoke `/v1/mcp/oauth/revoke`
 
 ```python
 @app.post("/v1/mcp/oauth/revoke")
@@ -613,7 +677,7 @@ async def revoke(token: str = Form(...)) -> Response:
 - Best-effort: tenta revogar o `refresh_token` no Linear; se falhar, prossegue e apaga o binding local de qualquer forma.
 - Sempre retorna 200 (não vaza se o bearer existia ou não — mitigação contra enumeration).
 
-### 5.8 Proxy `/mcp{path}` — onde o RBAC acontece (linhas 724-798)
+### 5.9 Proxy `/mcp{path}` — onde o RBAC acontece
 
 Este é o núcleo do enforcement em runtime:
 
@@ -695,9 +759,29 @@ upstream = await mcp_client.send(req, stream=True)
 - **`x-litellm-api-key: Bearer sk-...`** — o LiteLLM usa esse header como a credencial real da chamada. Ele aplica todo o seu RBAC nativo: allow-list de MCPs em `object_permission`, budgets, rate limits, `allowed_routes`. Se a key não tem `deepwiki_mcp` no escopo, o LiteLLM retorna 403 antes mesmo de tocar no upstream.
 - **`x-mcp-linear-authorization`** e **`x-mcp-linear_mcp-authorization`** — se houver `linear_access`, são enviados como "passagem opcional" para MCPs que declararem `extra_headers: ["authorization"]`. São prefixados pelo nome do MCP no LiteLLM (`linear_mcp`), permitindo que o LiteLLM associe o header ao servidor certo. Hoje, nenhum dos branches efetivamente exercita esse caminho para o Linear (o bypass do Branch A o evita), mas a infraestrutura está pronta para quando o issue #26700 for resolvido.
 
-Headers `HOP_BY_HOP` (linhas 111-115) — `connection`, `keep-alive`, `transfer-encoding`, `content-length`, `host`, etc. — são removidos antes de repassar, conforme RFC 7230.
+Headers `HOP_BY_HOP` — `connection`, `keep-alive`, `transfer-encoding`, `content-length`, `host`, etc. — são removidos antes de repassar, conforme RFC 7230.
 
-### 5.9 `_key_has_mcp()` em detalhe (linhas 605-631)
+#### Tracing Langfuse
+
+Cada chamada `/mcp/*` (em ambos os branches) gera um span Langfuse via `_start_mcp_span`. O nome do span segue o formato `<mcp_name>/<tool_ou_method>`:
+
+| Cenário JSON-RPC | Nome do span |
+|---|---|
+| `method=tools/call`, `params.name=read_wiki_structure` | `deepwiki_mcp/read_wiki_structure` |
+| `method=tools/list` | `deepwiki_mcp/tools/list` |
+| `method=initialize` | `deepwiki_mcp/initialize` |
+| Body não-JSON ou sem `method` | `deepwiki_mcp/request` |
+
+Outros atributos do span:
+
+- `trace.user_id` = `bearer[:16]` (16 caracteres do compound bearer, pseudo-anônimo).
+- `trace.session_id` = `sha256(virtual_key)[:12]` (hash truncado, agrupa sessões da mesma key).
+- `metadata.mcp.server`, `metadata.mcp.method`, `metadata.mcp.tool_name`, `metadata.mcp.jsonrpc_id`, `path`, `http_method`, `status_code`.
+- `input.body` e `output` carregam o payload bruto da request e a resposta (incluindo SSE quando streaming).
+
+`LANGFUSE_ENABLED` é `True` somente com `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` + SDK instalado. Sem isso, `_start_mcp_span` é no-op.
+
+### 5.10 `_key_has_mcp()` em detalhe
 
 ```python
 async def _key_has_mcp(api_key: str, server: str) -> bool:
@@ -758,12 +842,13 @@ Cenário: Alice (membro do team `eng-backend`, com `linear_mcp` e `deepwiki_mcp`
        &code_challenge_method=S256
        &state=<rand>
        &scope=
+       &resource=https://<gateway>/mcp/linear_mcp
    ```
-   Shim valida tudo, renderiza tela HTML pt-BR.
+   Shim valida tudo, extrai `alias=linear_mcp` de `resource`, renderiza tela HTML pt-BR exibindo o MCP solicitado.
 
-4. **Consent** — Alice cola `sk-virtual-key-abc123` (sua virtual key LiteLLM), marca "Conectar Linear", clica "Autorizar".
+4. **Consent** — Alice cola `sk-virtual-key-abc123` (sua virtual key LiteLLM) e clica "Autorizar". **Não há checkbox** — o shim já sabe que `linear_mcp` exige OAuth pessoal porque `MCP_AUTH_REGISTRY["linear_mcp"]["auth_type"] == "oauth"`.
 
-5. **Authorize (POST)** — Shim cria session Redis `mcp:session:<id>` com `api_key="sk-virtual-key-abc123"`, code_challenge, state original. Responde 302 para:
+5. **Authorize (POST) — dispatch automático para o provider** — Shim consulta `MCP_AUTH_REGISTRY["linear_mcp"]` → `provider="linear"` → `OAUTH_PROVIDERS["linear"]`. Cria session Redis `mcp:session:<id>` com `api_key="sk-virtual-key-abc123"`, code_challenge, state original e `provider="linear"`. Responde 302 para:
    ```
    https://linear.app/oauth/authorize
        ?client_id=<LINEAR_CLIENT_ID>
@@ -773,13 +858,14 @@ Cenário: Alice (membro do team `eng-backend`, com `linear_mcp` e `deepwiki_mcp`
        &state=<session_id>
        &actor=user
    ```
+   (Para um MCP com `auth_type=none` — ex.: `deepwiki_mcp` — este passo seria substituído por um 302 direto para `claude.ai/oauth/callback?code=...&state=...`, pulando os passos 6-7.)
 
 6. **Aprovação no Linear** — Alice faz login no Linear (se ainda não estava), aprova as permissões. Linear redireciona para:
    ```
    GET /v1/linear/callback?code=lin_code_xxx&state=<session_id>
    ```
 
-7. **Token exchange Linear** — Shim recupera session pelo `state`, deleta da Redis, troca `code=lin_code_xxx` por tokens no `LINEAR_TOKEN_URL`. Recebe `{access_token, refresh_token, expires_in}`.
+7. **Token exchange Linear** — Shim recupera session pelo `state`, valida `sess["provider"] == "linear"` (sentinela contra cross-provider), deleta da Redis, troca `code=lin_code_xxx` por tokens no `LINEAR_TOKEN_URL`. Recebe `{access_token, refresh_token, expires_in}`.
 
 8. **Mint shim auth code** — Shim chama `_mint_auth_code(api_key="sk-...", linear_access=..., linear_refresh=..., linear_exp=...)`. Armazena em Redis `mcp:code:<code>` TTL 300s. Retorna 302 para `https://claude.ai/oauth/callback?code=<shim_code>&state=<state_original>`.
 
@@ -812,6 +898,7 @@ Cenário: Alice (membro do team `eng-backend`, com `linear_mcp` e `deepwiki_mcp`
       - Set names = `{"linear_mcp", "deepwiki_mcp"}`. `"linear_mcp" in names` → True.
       - Cache `1` por 30s.
     - Proxy direto para `https://mcp.linear.app/mcp` com `Authorization: Bearer <linear_access>`.
+    - Span Langfuse emitido com nome `linear_mcp/<tool>` (ex.: `linear_mcp/save_issue`).
     - Streamea SSE de resposta.
 
 11. **Chamada MCP DeepWiki** — Claude Desktop `POST /mcp/deepwiki`:
@@ -820,6 +907,7 @@ Cenário: Alice (membro do team `eng-backend`, com `linear_mcp` e `deepwiki_mcp`
     - Headers: remove original `authorization`, adiciona `x-litellm-api-key: Bearer sk-virtual-key-abc123` + headers Linear (mesmo que não usados aqui).
     - Proxy para `http://litellm:4000/mcp/deepwiki`.
     - LiteLLM autentica a key, verifica que `deepwiki_mcp` está no escopo, repassa para `https://mcp.deepwiki.com/mcp`.
+    - Span Langfuse emitido com nome `deepwiki_mcp/<tool>`.
     - Resposta streamea de volta.
 
 12. **24h depois** — Token Linear expirou. Próxima chamada `/mcp/linear`:
@@ -919,7 +1007,7 @@ Cacheia respostas de modelos por hash do prompt+params. Reduz custo. Não afeta 
 | `LINEAR_REVOKE_URL` | env | Default `https://api.linear.app/oauth/revoke`. |
 | `LINEAR_MCP_URL` | env | Default `https://mcp.linear.app/mcp`. Endpoint para o bypass direto. |
 
-`LINEAR_ENABLED` (booleano interno) é `True` somente se `CLIENT_ID`, `CLIENT_SECRET` e `REDIRECT_URI` estiverem todos preenchidos. Caso contrário, a checkbox "Conectar Linear" some da tela.
+`LINEAR_ENABLED` (booleano interno) é `True` somente se `CLIENT_ID`, `CLIENT_SECRET` e `REDIRECT_URI` estiverem todos preenchidos. Quando falso, `OAUTH_PROVIDERS["linear"]` não é registrado, e qualquer authorize para `linear_mcp` falha com `400 oauth_provider_unavailable: linear`.
 
 ### 8.3 LiteLLM
 
@@ -931,7 +1019,7 @@ Cacheia respostas de modelos por hash do prompt+params. Reduz custo. Não afeta 
 | `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | `.env` | Credenciais dos provedores LLM. |
 | `REDIS_AUTH` | `.env` | Senha do Redis (compartilhada). |
 | `PRESIDIO_ANALYZER_API_BASE` / `PRESIDIO_ANONYMIZER_API_BASE` | compose | Endpoints do guardrail PII. |
-| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | `.env` | Observabilidade. |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` | `.env` | Observabilidade. Habilitam o tracing por span `<mcp_name>/<tool>` em cada chamada `/mcp/*`. Sem essas variáveis, o gateway opera normalmente — só não envia spans. **Atenção**: variáveis de shell exportadas (ex.: `export LANGFUSE_PUBLIC_KEY=...` no `.zshrc`) sobrepõem o `.env` no `docker compose`. Se o gateway loga `Failed to export span batch code: 401`, conferir `docker compose config | grep LANGFUSE_PUBLIC_KEY` contra o `.env` e desexportar do shell se divergir. |
 
 ---
 
@@ -1148,8 +1236,10 @@ curl -X POST http://localhost:4000/key/delete \
 | `403 forbidden linear_mcp not permitted for this key` | Virtual key não tem `linear_mcp` no `object_permission` do Team/User/Key | `curl /v1/mcp/server` com a key — `linear_mcp` ausente da resposta |
 | `400 invalid_grant` em `/v1/mcp/oauth/token` | PKCE não bate, code já foi consumido, ou TTL de 300s expirou | Cliente provavelmente regenerou o `code_verifier` entre authorize e token |
 | `400 invalid_redirect_uri` | `redirect_uri` fora da allow-list `ALLOWED_REDIRECT_PREFIXES` | Editar `.env` e reiniciar gateway |
-| Tela de consent não mostra checkbox Linear | `LINEAR_ENABLED=False` | Conferir `LINEAR_OAUTH_CLIENT_ID`/`_SECRET`/`REDIRECT_URI` no `.env` |
-| `400 session_expired` no callback Linear | Demorou mais de 600s no `linear.app/authorize`; ou container reiniciou | Aumentar `SESSION_TTL` no código, ou refazer o fluxo |
+| Tela de consent mostra `MCP genérico` em vez do alias | Cliente não enviou `resource` na URL, ou alias não está em `MCP_AUTH_REGISTRY` | Inspecionar URL do authorize: deve conter `&resource=https://<gateway>/mcp/<alias>` |
+| `400 oauth_provider_unavailable: linear` | `auth_type=oauth` no registry mas env do provider faltando | Conferir `LINEAR_OAUTH_CLIENT_ID`/`_SECRET`/`REDIRECT_URI` no `.env`; reiniciar gateway |
+| `400 provider_mismatch: 'X'` no `/v1/linear/callback` | Sessão Redis foi criada para outro provider, mas Claude bateu no callback Linear | Bug interno: cliente forjando state, ou novo provider sem callback dedicado |
+| `400 session_expired` no callback OAuth | Demorou mais de 600s no authorize do provider; ou container reiniciou | Aumentar `SESSION_TTL` no código, ou refazer o fluxo |
 | Linear retorna `invalid_redirect_uri` | `LINEAR_REDIRECT_URI` no `.env` ≠ valor cadastrado no app Linear | Conferir caractere por caractere, inclusive trailing slash |
 | 403 do LiteLLM em `/mcp/deepwiki` | `allowed_routes` não inclui `mcp_routes`, ou `deepwiki_mcp` fora do `object_permission` | Conferir Team/User/Key no admin UI |
 
@@ -1183,17 +1273,27 @@ Quando o upstream corrigir:
 - `linear_mcp` em `config.yaml` já tem `extra_headers: ["authorization"]` configurado — o LiteLLM passará a propagar o token Linear automaticamente.
 - Branch B já envia os headers `x-mcp-linear-authorization` e `x-mcp-linear_mcp-authorization`, prontos para esse cenário.
 
-### 11.3 OAuth pessoal só para Linear
+### 11.3 OAuth pessoal — generalização parcial concluída
 
-A infra de OAuth pessoal está acoplada ao Linear (variáveis `LINEAR_*`, branch `is_linear_path`, função `_refresh_linear`). Adicionar outro MCP com OAuth pessoal (Notion, GitHub, Jira, ...) exige:
+O dispatch (authorize POST → provider authorize URL) **já é genérico** desde a introdução de `MCP_AUTH_REGISTRY` + `OAUTH_PROVIDERS` (§5.2). O que ainda é Linear-específico:
 
-1. Adicionar variáveis `<X>_OAUTH_CLIENT_ID/_SECRET/_REDIRECT_URI/_SCOPES`.
-2. Replicar checkbox em `_AUTHORIZE_HTML` (ou tornar genérico).
-3. Adicionar campo `<x>_access`/`<x>_refresh`/`<x>_exp` no binding Redis.
-4. Replicar função `_refresh_<x>`.
-5. Caso o upstream tenha o mesmo bug do #26700, adicionar branch `is_<x>_path` em `mcp_proxy` e função `_proxy_to_<x>_direct`.
+- **Handler de callback**: existe apenas `/v1/linear/callback`. Cada provider precisa do seu próprio porque o token exchange tem formato proprietário (corpo, headers, parsing da resposta).
+- **Refresh**: `_refresh_linear` é hardcoded. Linear rotaciona `refresh_token`; Notion não; Slack tem regras próprias. Não dá pra unificar sem abstração.
+- **Campos do binding**: `linear_access`/`linear_refresh`/`linear_exp` no JSON do `mcp:bearer:*`. Para múltiplos providers simultâneos, precisa migrar para `oauth.<provider>.{access,refresh,exp}`.
+- **Header de propagação no Branch B**: `x-mcp-linear-authorization` e `x-mcp-linear_mcp-authorization` são hardcoded. Para Notion/Slack/etc., seria `x-mcp-<alias>-authorization` derivado do alias do MCP.
+- **Branch A (bypass)**: `is_linear_path` e `_proxy_to_linear_direct` existem por causa do bug #26700. Se outro provider sofrer o mesmo problema, precisa replicar.
 
-Refatoração futura: extrair "upstream provider" como abstração (`UpstreamOAuthProvider`), parametrizando endpoints + binding keys.
+Checklist para adicionar **Notion** (exemplo concreto):
+
+1. Adicionar variáveis `NOTION_OAUTH_CLIENT_ID/_SECRET/_REDIRECT_URI/_SCOPES` em `.env` e propagar via `docker-compose.yaml`.
+2. Acrescentar bloco `if NOTION_ENABLED: OAUTH_PROVIDERS["notion"] = {...}` em `app.py`.
+3. Acrescentar `"notion_mcp": {"auth_type": "oauth", "provider": "notion"}` em `MCP_AUTH_REGISTRY` (assumindo que o LiteLLM expõe `notion_mcp` em `mcp_servers`).
+4. Implementar `@app.get("/v1/notion/callback")` espelhando `linear_callback`, com o assert `sess.get("provider") != "notion"` para falhar alto se chegar payload errado.
+5. Adicionar campos `notion_access`/`notion_refresh`/`notion_exp` ao `_mint_auth_code` e ao binding Redis.
+6. Implementar `_refresh_notion(bearer, bind)`.
+7. No proxy, se Notion sofrer um bug equivalente ao #26700, adicionar `is_notion_path` e `_proxy_to_notion_direct`. Caso contrário, basta o Branch B com `extra_headers: ["authorization"]` em `notion_mcp` no `config.yaml` do LiteLLM.
+
+Refatoração futura recomendada: extrair "upstream provider" como abstração (`UpstreamOAuthProvider`), parametrizando token endpoint, callback handler e refresh — eliminando o trabalho repetitivo dos itens 4-6 acima. Isso transformaria o checklist em "adicione uma linha em `OAUTH_PROVIDERS`".
 
 ### 11.4 Sem rotação de bearer
 
