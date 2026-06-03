@@ -51,6 +51,9 @@ except ImportError:  # pragma: no cover - SDK optional
 LITELLM_BASE = os.environ["LITELLM_BASE_URL"].rstrip("/")
 PUBLIC_BASE = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 REDIS_URL = os.environ["REDIS_URL"]
+# Admin key for resolving a virtual key -> owning user email via /key/info.
+# Optional: without it, traces fall back to a hashed key id instead of email.
+LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 
 LINEAR_CLIENT_ID = os.environ.get("LINEAR_OAUTH_CLIENT_ID", "")
 LINEAR_CLIENT_SECRET = os.environ.get("LINEAR_OAUTH_CLIENT_SECRET", "")
@@ -84,7 +87,7 @@ if LINEAR_ENABLED:
 # Adding a new MCP: add a row here. Adding a new OAuth provider: add a row
 # above + a callback handler below.
 MCP_AUTH_REGISTRY: dict[str, dict[str, str]] = {
-    "linear_mcp":   {"auth_type": "oauth", "provider": "linear"},
+    "linear_mcp": {"auth_type": "oauth", "provider": "linear"},
     "deepwiki_mcp": {"auth_type": "none"},
 }
 
@@ -100,11 +103,14 @@ ALLOWED_REDIRECT_PREFIXES = [
 SESSION_TTL = 600
 AUTH_CODE_TTL = 300
 BEARER_TTL = int(os.environ.get("MCP_BEARER_TTL", str(30 * 24 * 3600)))
-REFRESH_LEAD = 60
+REFRESH_LEAD = 10
 
 K_SESSION = "mcp:session:"
 K_CODE = "mcp:code:"
 K_BEARER = "mcp:bearer:"
+K_EMAIL = "mcp:email:"
+
+EMAIL_TTL = int(os.environ.get("MCP_EMAIL_TTL", "3600"))
 
 app = FastAPI(title="LiteLLM MCP OAuth Gateway (compound)")
 
@@ -133,7 +139,9 @@ r = redis_async.from_url(REDIS_URL, decode_responses=True)
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "")
-LANGFUSE_ENABLED = bool(LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY and Langfuse is not None)
+LANGFUSE_ENABLED = bool(
+    LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY and Langfuse is not None
+)
 
 if LANGFUSE_ENABLED:
     langfuse = Langfuse(
@@ -149,9 +157,17 @@ else:
 CLIENTS: dict[str, dict[str, Any]] = {}
 
 HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
-    "content-length", "content-encoding", "host",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "content-encoding",
+    "host",
 }
 TOKEN_NO_CACHE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
@@ -195,7 +211,8 @@ async def health() -> dict[str, bool]:
 
 
 @app.get("/.well-known/oauth-authorization-server")
-async def auth_server_metadata() -> dict[str, Any]:
+@app.get("/.well-known/oauth-authorization-server{resource_path:path}")
+async def auth_server_metadata(resource_path: str = "") -> dict[str, Any]:
     return {
         "issuer": PUBLIC_BASE,
         "authorization_endpoint": f"{PUBLIC_BASE}/v1/mcp/oauth/authorize",
@@ -341,6 +358,7 @@ A master key também é aceita em laboratórios single-user.</p>
 </script>
 </body></html>"""
 
+
 def _render_authorize(
     client_id: str,
     client_name: str,
@@ -404,9 +422,15 @@ async def authorize_get(request: Request) -> HTMLResponse:
 
     return HTMLResponse(
         _render_authorize(
-            client_id, client_name, redirect_uri,
-            code_challenge, code_challenge_method, state, scope,
-            resource, mcp_label,
+            client_id,
+            client_name,
+            redirect_uri,
+            code_challenge,
+            code_challenge_method,
+            state,
+            scope,
+            resource,
+            mcp_label,
         )
     )
 
@@ -466,8 +490,13 @@ async def authorize_post(
     if not api_key.strip():
         raise HTTPException(400, "api_key required")
 
+    # resource carries the URL alias (e.g. "linear", "deepwiki", "deep_wiki");
+    # resolve it to the canonical server name so it matches MCP_AUTH_REGISTRY
+    # keys ("linear_mcp"/"deepwiki_mcp"). Without this, "linear" misses the
+    # registry and falls through to auth_type=none, skipping Linear OAuth.
     alias = _alias_from_resource(resource)
-    entry = MCP_AUTH_REGISTRY.get(alias, {"auth_type": "none"})
+    server = _server_from_path("/" + alias) if alias else ""
+    entry = MCP_AUTH_REGISTRY.get(server, {"auth_type": "none"})
 
     if entry["auth_type"] == "none":
         return await _mint_auth_code(
@@ -589,12 +618,14 @@ async def token(
         return JSONResponse({"error": "invalid_grant"}, 400, headers=TOKEN_NO_CACHE)
 
     bearer = "cmp_" + secrets.token_urlsafe(48)
+    user_email = await _resolve_user_email(rec["api_key"])
     await r.setex(
         K_BEARER + bearer,
         BEARER_TTL,
         json.dumps(
             {
                 "api_key": rec["api_key"],
+                "user_email": user_email,
                 "linear_access": rec.get("linear_access", ""),
                 "linear_refresh": rec.get("linear_refresh", ""),
                 "linear_exp": int(rec.get("linear_exp", 0)),
@@ -636,7 +667,7 @@ async def revoke(token: str = Form(...)) -> Response:
     return Response(status_code=200, headers=TOKEN_NO_CACHE)
 
 
-MCP_PERM_TTL = int(os.environ.get("MCP_PERM_TTL", "30"))
+MCP_PERM_TTL = int(os.environ.get("MCP_PERM_TTL", "10"))
 K_PERM = "mcp:perm:"
 
 
@@ -669,6 +700,108 @@ async def _key_has_mcp(api_key: str, server: str) -> bool:
     return allowed
 
 
+def _emailish(v: Any) -> str:
+    return v if isinstance(v, str) and "@" in v else ""
+
+
+async def _resolve_user_email(api_key: str) -> str:
+    """Resolve a LiteLLM virtual key to its owning user email.
+
+    Two hops with the admin master key: `/key/info` yields the key's `user_id`
+    (an opaque UUID in this stack), then `/user/info` maps that UUID to
+    `user_email`. Falls back to the UUID when no email exists. Cached in Redis
+    (empty/uuid result cached too) to avoid hammering LiteLLM. Returns "" when
+    unknown/unreachable so callers fall back to a hashed key id.
+    """
+    if not api_key:
+        return ""
+    cache_key = K_EMAIL + hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    cached = await r.get(cache_key)
+    if cached is not None:
+        return cached
+    email = ""
+    if LITELLM_MASTER_KEY:
+        hdr = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}"}
+        try:
+            user_id = ""
+            resp = await client.get("/key/info", params={"key": api_key}, headers=hdr)
+            if resp.status_code == 200:
+                data = resp.json()
+                info = data.get("info", data) if isinstance(data, dict) else {}
+                if isinstance(info, dict):
+                    email = _emailish(info.get("user_email")) or _emailish(
+                        info.get("user_id")
+                    )
+                    user_id = info.get("user_id") or ""
+            # key's user_id is a UUID -> resolve the email from /user/info
+            if not email and user_id:
+                uresp = await client.get(
+                    "/user/info", params={"user_id": user_id}, headers=hdr
+                )
+                if uresp.status_code == 200:
+                    udata = uresp.json()
+                    uinfo = (
+                        udata.get("user_info", udata) if isinstance(udata, dict) else {}
+                    )
+                    if isinstance(uinfo, dict):
+                        email = _emailish(uinfo.get("user_email"))
+                # last resort: keep the UUID as a stable identity
+                email = email or user_id
+        except httpx.HTTPError:
+            email = ""
+    await r.setex(cache_key, EMAIL_TTL, email)
+    return email
+
+
+def _restricted_mcp_response(parsed: dict[str, Any], server: str) -> Response:
+    """Synthetic MCP responses for a server this key may not use.
+
+    Lets the transport handshake (initialize / notifications / ping) succeed so
+    the connector shows as connected, while hiding tools (tools/list -> empty)
+    and blocking execution (tools/call -> JSON-RPC error). Granting the MCP to
+    the team makes a later refresh proxy the real tools through.
+    """
+    method = parsed.get("method")
+    jid = parsed.get("jsonrpc_id")
+
+    if not method:  # GET SSE open / malformed body
+        return Response(status_code=202)
+    if method.startswith("notifications/"):
+        return Response(status_code=202)
+    if method == "initialize":
+        params = parsed.get("params") or {}
+        proto = params.get("protocolVersion") or "2025-06-18"
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "id": jid,
+                "result": {
+                    "protocolVersion": proto,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {
+                        "name": f"{server} (restricted)",
+                        "version": "0.0.0",
+                    },
+                },
+            },
+            headers={"Mcp-Session-Id": secrets.token_urlsafe(16)},
+        )
+    if method == "tools/list":
+        return JSONResponse({"jsonrpc": "2.0", "id": jid, "result": {"tools": []}})
+    if method == "ping":
+        return JSONResponse({"jsonrpc": "2.0", "id": jid, "result": {}})
+    return JSONResponse(
+        {
+            "jsonrpc": "2.0",
+            "id": jid,
+            "error": {
+                "code": -32000,
+                "message": f"{server} not permitted for this key",
+            },
+        }
+    )
+
+
 async def _refresh_linear(bearer: str, bind: dict[str, Any]) -> dict[str, Any]:
     rt = bind.get("linear_refresh")
     if not rt:
@@ -699,9 +832,7 @@ async def _refresh_linear(bearer: str, bind: dict[str, Any]) -> dict[str, Any]:
 
 def _unauth_response(path: str) -> Response:
     resource_path = f"/mcp{path}" if path else "/mcp/"
-    metadata_url = (
-        f"{PUBLIC_BASE}/.well-known/oauth-protected-resource{resource_path}"
-    )
+    metadata_url = f"{PUBLIC_BASE}/.well-known/oauth-protected-resource{resource_path}"
     return Response(
         content=json.dumps(
             {"error": "unauthorized", "error_description": "OAuth required"}
@@ -709,8 +840,7 @@ def _unauth_response(path: str) -> Response:
         status_code=401,
         headers={
             "WWW-Authenticate": (
-                f'Bearer realm="litellm-mcp", '
-                f'resource_metadata="{metadata_url}"'
+                f'Bearer realm="litellm-mcp", resource_metadata="{metadata_url}"'
             ),
         },
         media_type="application/json",
@@ -740,19 +870,94 @@ def _parse_mcp_request(body: bytes) -> dict[str, Any]:
     return out
 
 
-def _user_ids(bearer: str, api_key: str) -> tuple[str, str]:
-    user_id = bearer[:16] if bearer else "anonymous"
-    session_id = (
-        hashlib.sha256(api_key.encode()).hexdigest()[:12] if api_key else ""
-    )
-    return user_id, session_id
+def _user_id(email: str, api_key: str, bearer: str) -> str:
+    """Langfuse user_id. Email when resolvable (the filterable identity);
+    degrades to a stable hashed key id, then the bearer prefix."""
+    if email:
+        return email
+    if api_key:
+        return "key:" + hashlib.sha256(api_key.encode()).hexdigest()[:12]
+    return bearer[:16] if bearer else "anonymous"
+
+
+def _parse_traceparent(value: str) -> tuple[str | None, str | None]:
+    """Parse W3C traceparent `00-<32hex>-<16hex>-<flags>` -> (trace_id, span_id)."""
+    if not value:
+        return None, None
+    parts = value.strip().split("-")
+    if len(parts) != 4:
+        return None, None
+    _, trace_id, span_id, _flags = parts
+    if len(trace_id) != 32 or len(span_id) != 16:
+        return None, None
+    if trace_id == "0" * 32 or span_id == "0" * 16:
+        return None, None
+    try:
+        int(trace_id, 16)
+        int(span_id, 16)
+    except ValueError:
+        return None, None
+    return trace_id, span_id
+
+
+def _parse_baggage(value: str) -> dict[str, str]:
+    """Parse W3C baggage `k1=v1,k2=v2` -> dict. Ignores malformed members."""
+    out: dict[str, str] = {}
+    if not value:
+        return out
+    for member in value.split(","):
+        key, sep, val = member.partition("=")
+        key = key.strip()
+        if key and sep:
+            out[key] = val.strip()
+    return out
+
+
+_SESSION_BAGGAGE_KEYS = (
+    "session.id",
+    "sessionId",
+    "session_id",
+    "conversation_id",
+    "conversation.id",
+)
+
+
+def _session_id(headers, bearer: str) -> str:
+    """Best-effort Claude-session id, in precedence order:
+
+      1. Mcp-Session-Id request header (spec-compliant / non-Claude clients)
+      2. session/conversation key in W3C baggage
+      3. W3C traceparent trace-id (per Claude trace)
+      4. hash of the bearer (per OAuth connection)
+
+    Claude Desktop/Code echo none of the first three reliably
+    (claude-code#41836), so the per-connection hash is the practical floor.
+    """
+    sid = headers.get("mcp-session-id", "")
+    if sid:
+        return sid
+    bag = _parse_baggage(headers.get("baggage", ""))
+    for key in _SESSION_BAGGAGE_KEYS:
+        if bag.get(key):
+            return bag[key]
+    trace_id, _ = _parse_traceparent(headers.get("traceparent", ""))
+    if trace_id:
+        return trace_id
+    return hashlib.sha256(bearer.encode()).hexdigest()[:16] if bearer else ""
+
+
+def _client_label(user_agent: str) -> str:
+    ua = (user_agent or "").strip()
+    if ua.startswith("Claude"):
+        return "claude"
+    return ua[:40] if ua else "unknown"
 
 
 def _server_from_path(path: str) -> str:
     p = path.lstrip("/")
     if p.startswith("linear"):
         return "linear_mcp"
-    if p.startswith("deepwiki"):
+    if p.startswith("deepwiki") or p.startswith("deep_wiki"):
         return "deepwiki_mcp"
     return p.split("/", 1)[0] or "mcp_root"
 
@@ -786,16 +991,28 @@ def _start_mcp_span(
     name: str,
     body: bytes,
     parsed: dict[str, Any],
-    user_id: str,
-    session_id: str,
+    headers,
+    bearer: str,
+    email: str,
+    api_key: str,
     server: str,
     path: str,
     http_method: str,
 ):
     if not LANGFUSE_ENABLED or langfuse is None:
         return None
+    user_agent = headers.get("user-agent", "")
+    traceparent = headers.get("traceparent", "")
+    baggage = headers.get("baggage", "")
+    # Distributed-trace linking: nest the gateway span under the client's W3C
+    # trace so every span Claude emits for one trace renders together.
+    trace_id, parent_span_id = _parse_traceparent(traceparent)
+    trace_context = (
+        {"trace_id": trace_id, "parent_span_id": parent_span_id} if trace_id else None
+    )
     span = langfuse.start_span(
         name=name,
+        trace_context=trace_context,
         input={
             "body": body.decode(errors="replace"),
             "parsed": parsed,
@@ -805,15 +1022,19 @@ def _start_mcp_span(
             "mcp.method": parsed.get("method"),
             "mcp.tool_name": parsed.get("tool_name"),
             "mcp.jsonrpc_id": parsed.get("jsonrpc_id"),
+            "mcp.protocol_version": headers.get("mcp-protocol-version"),
+            "client.user_agent": user_agent,
+            "w3c.traceparent": traceparent,
+            "w3c.baggage": baggage,
             "path": path,
             "http_method": http_method,
         },
     )
     try:
         span.update_trace(
-            user_id=user_id,
-            session_id=session_id or None,
-            tags=["mcp", server],
+            user_id=_user_id(email, api_key, bearer),
+            session_id=_session_id(headers, bearer) or None,
+            tags=["mcp", server, _client_label(user_agent)],
         )
     except Exception:
         pass
@@ -946,17 +1167,25 @@ async def mcp_proxy(path: str, request: Request) -> Response:
         raw = await r.get(K_BEARER + bearer)
         if raw:
             bind = json.loads(raw)
-            if bind.get("linear_exp") and bind["linear_exp"] < time.time() + REFRESH_LEAD:
+            if (
+                bind.get("linear_exp")
+                and bind["linear_exp"] < time.time() + REFRESH_LEAD
+            ):
                 bind = await _refresh_linear(bearer, bind)
 
     api_key = (bind or {}).get("api_key", "")
-    user_id, session_id = _user_ids(bearer, api_key)
+    email = (bind or {}).get("user_email", "")
+    if api_key and "@" not in email:
+        # Missing, or a UUID baked into an older binding -> resolve (cached).
+        email = await _resolve_user_email(api_key)
     span = _start_mcp_span(
         name=_span_name(parsed, server),
         body=body,
         parsed=parsed,
-        user_id=user_id,
-        session_id=session_id,
+        headers=request.headers,
+        bearer=bearer,
+        email=email,
+        api_key=api_key,
         server=server,
         path=path,
         http_method=request.method,
@@ -969,24 +1198,22 @@ async def mcp_proxy(path: str, request: Request) -> Response:
             return resp
 
         is_linear_path = path.startswith("/linear")
+
+        # Linear needs per-user OAuth identity before anything else.
+        if is_linear_path and not bind.get("linear_access"):
+            resp = _unauth_response(path)
+            _end_span_sync(span, status_code=401, output="linear_unauth")
+            return resp
+
+        # Per-server RBAC gate (team/user/key allow-list via LiteLLM
+        # /v1/mcp/server). Not in scope -> do NOT hard-fail: connector
+        # connects, but tools stay hidden until the MCP is granted.
+        if not await _key_has_mcp(bind["api_key"], server):
+            resp = _restricted_mcp_response(parsed, server)
+            _end_span_sync(span, status_code=200, output="restricted")
+            return resp
+
         if is_linear_path:
-            if not bind.get("linear_access"):
-                resp = _unauth_response(path)
-                _end_span_sync(span, status_code=401, output="linear_unauth")
-                return resp
-            if not await _key_has_mcp(bind["api_key"], "linear_mcp"):
-                resp = Response(
-                    content=json.dumps(
-                        {
-                            "error": "forbidden",
-                            "error_description": "linear_mcp not permitted for this key",
-                        }
-                    ),
-                    status_code=403,
-                    media_type="application/json",
-                )
-                _end_span_sync(span, status_code=403, output="forbidden")
-                return resp
             return await _proxy_to_linear_direct(request, bind, body, span)
 
         headers = {
@@ -997,7 +1224,9 @@ async def mcp_proxy(path: str, request: Request) -> Response:
         headers["x-litellm-api-key"] = f"Bearer {bind['api_key']}"
         if bind.get("linear_access"):
             headers["x-mcp-linear-authorization"] = f"Bearer {bind['linear_access']}"
-            headers["x-mcp-linear_mcp-authorization"] = f"Bearer {bind['linear_access']}"
+            headers["x-mcp-linear_mcp-authorization"] = (
+                f"Bearer {bind['linear_access']}"
+            )
 
         upstream = await _send_with_retry(
             mcp_client,

@@ -33,6 +33,9 @@ litellm_settings:
     models: ["gemini-3-flash", "minimax-m2.5"]
     tpm_limit: 10000
     rpm_limit: 60
+    # nota: NÃO propaga para `allowed_routes` de keys geradas (no-op p/ key gen).
+    # Só o `key_type` define routes da key. Para MCP, gere a key com key type
+    # "Full Access" na UI (allowed_routes vazio). Ver docs/rbac-mcp.md §2.4.1.
     allowed_routes: ["llm_api_routes", "mcp_routes"]
 
   upperbound_key_generate_params:
@@ -45,6 +48,7 @@ litellm_settings:
 
   mcp_aliases:
     "deepwiki": "deepwiki_mcp"
+    "deep_wiki": "deepwiki_mcp"
     "linear": "linear_mcp"
 
 mcp_servers:

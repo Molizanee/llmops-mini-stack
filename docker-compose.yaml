@@ -249,12 +249,19 @@ services:
     networks: [llmops]
     ports:
       - "5002:3000"
+    # Override the image entrypoint (gunicorn -w 1, no --timeout). --preload
+    # loads the WSGI app in the master and forks workers from it, eliminating
+    # the per-worker create_app() init hang that intermittently wedged a lone
+    # sync worker (master logged "Using worker: sync" but never "Booting
+    # worker", and /health never responded). --timeout reaps any worker that
+    # still wedges so the arbiter respawns it.
+    command: ["poetry", "run", "gunicorn", "--preload", "--workers", "1", "--timeout", "120", "--graceful-timeout", "30", "-b", "0.0.0.0:3000", "app:create_app()"]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3000/health || exit 1"]
       interval: 15s
       timeout: 10s
-      retries: 5
-      start_period: 30s
+      retries: 8
+      start_period: 40s
     deploy:
       resources:
         limits:
@@ -266,16 +273,19 @@ services:
     networks: [llmops]
     ports:
       - "5001:3000"
+    # See presidio-analyzer note. 2 workers add redundancy (one wedged worker
+    # can't down the service); --preload + --timeout handle the boot hang.
+    command: ["poetry", "run", "gunicorn", "--preload", "--workers", "2", "--timeout", "120", "--graceful-timeout", "30", "-b", "0.0.0.0:3000", "app:create_app()"]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3000/health || exit 1"]
       interval: 15s
       timeout: 10s
-      retries: 5
-      start_period: 15s
+      retries: 8
+      start_period: 30s
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 768M
 
   litellm:
     image: ghcr.io/berriai/litellm:v1.85.0
@@ -341,6 +351,7 @@ services:
         condition: service_healthy
     environment:
       LITELLM_BASE_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       PUBLIC_BASE_URL: ${MCP_GATEWAY_PUBLIC_URL}
       ALLOWED_REDIRECT_PREFIXES: ${MCP_ALLOWED_REDIRECT_PREFIXES:-https://claude.ai/,https://claude.com/,http://localhost,http://127.0.0.1}
       REDIS_URL: redis://:${REDIS_AUTH}@redis:6379/2

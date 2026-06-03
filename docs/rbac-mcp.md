@@ -180,13 +180,48 @@ Team
 
 Cada camada pode SOMENTE restringir a anterior. Uma key não pode ter mais modelos do que o User, e o User não pode ter mais modelos do que o Team. O mesmo vale para MCPs (`object_permission.mcp_servers`).
 
+### 2.4.1 Como a herança de MCP realmente funciona (LiteLLM v1.85.0)
+
+A herança automática de MCPs do Team para a key depende de **duas** condições. Faltando qualquer uma, a key não enxerga os MCPs do Team e o shim esconde as tools (`tools/list` vazio):
+
+**1. Os MCPs precisam estar em `object_permission.mcp_servers` do Team.** O resolver de permissão (`MCPRequestHandler.get_allowed_mcp_servers`) só herda dessa lista. Key **sem** `object_permission` próprio herda a lista inteira do Team; key **com** lista própria resulta na **interseção** (só restringe, nunca amplia). Configure pelo **nome** do servidor (`deepwiki_mcp`, `linear_mcp`), não pelo ID — IDs de servidores declarados no YAML mudam quando o config muda e viram referências mortas (sintoma: só parte dos MCPs do Team é herdada):
+
+```bash
+curl -X POST http://litellm:4000/team/update \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"team_id":"<team_id>","object_permission":{"mcp_servers":["deepwiki_mcp","linear_mcp"]}}'
+```
+
+> ATENÇÃO: o seletor "Allowed MCP Servers" na tela de edição de Team da UI pode gravar via *access group* sem criar a linha `LiteLLM_ObjectPermissionTable` (bug LiteLLM [#27657](https://github.com/BerriAI/litellm/issues/27657)), deixando `team.object_permission` nulo — a herança falha em silêncio. Prefira o `/team/update` por nome acima.
+
+**2. A key precisa alcançar `/v1/mcp/server`.** O shim consulta essa rota em `_key_has_mcp` (`mcp-gateway/app.py:649`) como ponto de enforcement. Ela pertence ao grupo `mcp_routes` (especificamente `mcp_management_routes`). O grupo `llm_api_routes` inclui `/mcp/*` (chamadas de tool) mas **não** `/v1/mcp/server`. Logo:
+
+| key `allowed_routes`                                | alcança `/v1/mcp/server`? | shim mostra tools? |
+|-----------------------------------------------------|---------------------------|--------------------|
+| `[]` (vazio = irrestrito; key type "Full Access")   | sim                       | sim                |
+| `["llm_api_routes", "mcp_routes"]`                  | sim                       | sim                |
+| `["llm_api_routes"]` (UI key type "AI APIs")        | **não** (403)             | **não**            |
+
+A UI de "Create Key" tem um dropdown **key type** com 3 opções (`create_key_button.tsx`):
+
+| Label na UI    | `key_type`   | `allowed_routes` resultante | alcança MCP? |
+|----------------|--------------|-----------------------------|--------------|
+| **AI APIs**    | `llm_api`    | `["llm_api_routes"]`        | não (padrão; bloqueia `/v1/mcp/server`) |
+| **Management** | `management` | rotas de management         | não (sem `/mcp/*` de inference) |
+| **Full Access**| `default`    | `[]` (irrestrito)           | **sim** |
+
+O padrão é **"AI APIs"** (PR LiteLLM [#19516](https://github.com/BerriAI/litellm/pull/19516)) — por isso keys novas criadas na UI não enxergam MCP nenhum, retornando `Virtual key is not allowed to call this route ... ['llm_api_routes']` no `/v1/mcp/server`. O form **não tem** campo de `allowed_routes`/`mcp_routes`. **Não há config que injete `mcp_routes` por padrão**: o `default_internal_user_params.allowed_routes` do `config.yaml` **não propaga** para keys (no-op para geração de key — só o `key_type` define `allowed_routes`).
+
+> **Fluxo recomendado:** ao gerar a VK na UI, escolha key type **"Full Access"** (vira `allowed_routes: []`). A key herda automaticamente os MCPs do Team, sem associação manual por key. Trade-off: a key fica irrestrita por rota (mas o `user_role: internal_user` ainda bloqueia mutações de admin). Para uma key least-privilege (`llm+mcp` somente), a UI não oferece opção — use a API com `allowed_routes: ["llm_api_routes","mcp_routes"]`.
+
 ### 2.5 Como criar Team com MCPs específicos
 
 Via UI (`:4000` → Teams → New):
 
 1. Definir `team_alias` (ex: `eng-backend`).
 2. Em **Models**: marcar os modelos LLM permitidos para o team.
-3. Em **Allowed MCP Servers** (ou via `object_permission.mcp_servers`): marcar `deepwiki_mcp` e/ou `linear_mcp` (os mesmos nomes declarados em `mcp_servers:` do `config.yaml`).
+3. Em **Allowed MCP Servers**: marcar `deepwiki_mcp` e/ou `linear_mcp` (os mesmos nomes declarados em `mcp_servers:` do `config.yaml`). **Recomendado:** confirmar/setar pelo `/team/update` por nome (ver §2.4.1) — o seletor da UI pode não persistir em `object_permission.mcp_servers` (bug #27657) e quebrar a herança.
 4. Definir budget de team se desejado (limite agregado de todos os membros).
 5. Salvar. Membros recebem convite por e-mail ou são adicionados via API.
 
@@ -706,33 +741,51 @@ async def mcp_proxy(path: str, request: Request) -> Response:
 
 `_unauth_response` retorna 401 com `WWW-Authenticate` apontando para o `oauth-protected-resource` metadata — o cliente MCP usa isso para descobrir o AS e reiniciar o fluxo automaticamente.
 
-#### Branch A — path `/linear*` (bypass direto)
+#### Gate genérico de RBAC por MCP (todos os paths)
 
 ```python
 is_linear_path = path.startswith("/linear")
+
+# Linear exige identidade OAuth do usuário antes de tudo.
+if is_linear_path and not bind.get("linear_access"):
+    return _unauth_response(path)
+
+# Gate de RBAC por servidor (allow-list Team/User/Key via /v1/mcp/server).
+# Fora do escopo -> NÃO derruba a conexão: o conector conecta, mas as tools
+# ficam ocultas até o MCP ser concedido ao team.
+if not await _key_has_mcp(bind["api_key"], server):
+    return _restricted_mcp_response(parsed, server)
+
 if is_linear_path:
-    if not bind.get("linear_access"):
-        return _unauth_response(path)
-    if not await _key_has_mcp(bind["api_key"], "linear_mcp"):
-        return Response(
-            content=json.dumps({"error": "forbidden",
-                                "error_description": "linear_mcp not permitted for this key"}),
-            status_code=403,
-            media_type="application/json",
-        )
-    return await _proxy_to_linear_direct(request, bind)
+    return await _proxy_to_linear_direct(request, bind, body, span)
 ```
+
+O `server` vem de `_server_from_path` (`linear_mcp` para `/linear`, `deepwiki_mcp`
+para `/deepwiki`). O gate roda **para todos os MCPs** — Linear e demais — usando o
+mesmo `_key_has_mcp`.
+
+**Por que não retornar 403 quando o MCP está fora do escopo?** Porque o LiteLLM
+retorna 403 na rota `/mcp/<alias>` inteira (inclusive no `initialize`) quando a key
+não tem o MCP — isso faz o conector **falhar ao conectar** em vez de conectar sem
+tools. `_restricted_mcp_response` sintetiza por método: `initialize` → sucesso
+(conecta), `tools/list` → `{"tools": []}` (zero tools), `notifications/*`/`ping` →
+vazio, `tools/call` e demais → erro JSON-RPC `-32000`. Conceder o MCP ao team faz o
+`_key_has_mcp` virar `True` após o TTL de cache de 30s (`MCP_PERM_TTL`); um refresh
+no Claude Desktop passa a proxar as tools reais. Spans Langfuse do período gated
+carregam `output="restricted"`.
+
+#### Branch A — path `/linear*` (bypass direto, após o gate)
+
+`_proxy_to_linear_direct(request, bind, body, span)`.
 
 **Por que bypass?** Comentário em `app.py:98-100`:
 
 > Direct Linear MCP proxy. Bypasses LiteLLM because v1.85.0 cannot proxy streamable-http MCP servers (BerriAI/litellm#26700 — AnyIO cancel-scope bug in upstream MCP Python SDK). Streams SSE; no read timeout.
 
-Sequência:
+Sequência (já passou pelo OAuth-check e pelo gate de RBAC acima):
 
-1. **Confirma que o usuário fez OAuth Linear** (`bind["linear_access"]` presente).
-2. **Confirma RBAC** via `_key_has_mcp(api_key, "linear_mcp")` — pergunta ao LiteLLM se a virtual key tem `linear_mcp` em `object_permission.mcp_servers`. Cache 30s (`MCP_PERM_TTL`).
-3. Se OK: chama `_proxy_to_linear_direct(request, bind)` (linhas 682-721), que faz request para `LINEAR_MCP_URL` (`mcp.linear.app/mcp`) substituindo o header `authorization` pelo `Bearer <linear_access>`.
-4. Streamea SSE de volta ao cliente com `aiter_raw()` + `BackgroundTask(upstream.aclose)`.
+1. Chama `_proxy_to_linear_direct(request, bind, body, span)`, que faz request para `LINEAR_MCP_URL` (`mcp.linear.app/mcp`) substituindo o header `authorization` pelo `Bearer <linear_access>`.
+2. Streamea SSE de volta ao cliente com `aiter_raw()` + `BackgroundTask(upstream.aclose)`.
 
 Importante: nesse branch, o **LiteLLM não é consultado** para a chamada em si — o tráfego MCP vai direto cliente → shim → Linear. O LiteLLM é consultado apenas para a decisão de autorização (`_key_has_mcp`).
 
@@ -756,7 +809,7 @@ req = mcp_client.build_request(request.method, upstream_url,
 upstream = await mcp_client.send(req, stream=True)
 ```
 
-- **`x-litellm-api-key: Bearer sk-...`** — o LiteLLM usa esse header como a credencial real da chamada. Ele aplica todo o seu RBAC nativo: allow-list de MCPs em `object_permission`, budgets, rate limits, `allowed_routes`. Se a key não tem `deepwiki_mcp` no escopo, o LiteLLM retorna 403 antes mesmo de tocar no upstream.
+- **`x-litellm-api-key: Bearer sk-...`** — o LiteLLM usa esse header como a credencial real da chamada. Ele aplica todo o seu RBAC nativo: allow-list de MCPs em `object_permission`, budgets, rate limits, `allowed_routes`. Como o gate `_key_has_mcp` já roda no shim antes do Branch B, o LiteLLM só é alcançado quando o MCP está no escopo — o caso "fora do escopo" é tratado por `_restricted_mcp_response` e nunca chega ao 403 do LiteLLM.
 - **`x-mcp-linear-authorization`** e **`x-mcp-linear_mcp-authorization`** — se houver `linear_access`, são enviados como "passagem opcional" para MCPs que declararem `extra_headers: ["authorization"]`. São prefixados pelo nome do MCP no LiteLLM (`linear_mcp`), permitindo que o LiteLLM associe o header ao servidor certo. Hoje, nenhum dos branches efetivamente exercita esse caminho para o Linear (o bypass do Branch A o evita), mas a infraestrutura está pronta para quando o issue #26700 for resolvido.
 
 Headers `HOP_BY_HOP` — `connection`, `keep-alive`, `transfer-encoding`, `content-length`, `host`, etc. — são removidos antes de repassar, conforme RFC 7230.
@@ -774,9 +827,16 @@ Cada chamada `/mcp/*` (em ambos os branches) gera um span Langfuse via `_start_m
 
 Outros atributos do span:
 
-- `trace.user_id` = `bearer[:16]` (16 caracteres do compound bearer, pseudo-anônimo).
-- `trace.session_id` = `sha256(virtual_key)[:12]` (hash truncado, agrupa sessões da mesma key).
-- `metadata.mcp.server`, `metadata.mcp.method`, `metadata.mcp.tool_name`, `metadata.mcp.jsonrpc_id`, `path`, `http_method`, `status_code`.
+- **`trace.user_id` = email do dono da virtual key.** `_resolve_user_email` faz dois saltos com `LITELLM_MASTER_KEY`: (1) `/key/info?key=<vk>` → `info.user_id` (um UUID neste stack); (2) `/user/info?user_id=<uuid>` → `user_info.user_email`. O resultado é cacheado no Redis (`mcp:email:<sha256(key)[:16]>`, TTL `MCP_EMAIL_TTL`=3600s) e gravado no binding do bearer no mint (`/v1/mcp/oauth/token`); bindings antigos que guardaram o UUID são re-resolvidos quando o valor não contém `@`. Sem email disponível mantém o UUID; sem master key/resposta degrada para `key:<sha256(key)[:12]>` (`_user_id`) — nunca quebra o proxy.
+- **`trace.session_id` = sessão do Claude (best-effort)**, por cadeia de precedência (`_session_id`):
+  1. header `Mcp-Session-Id` (clientes spec-compliant);
+  2. chave de sessão/conversa no `baggage` W3C (`session.id`, `conversation_id`, ...);
+  3. `trace_id` do `traceparent` W3C (por trace do Claude);
+  4. `sha256(bearer)[:16]` (por conexão OAuth).
+  Claude Desktop/Code **não ecoam** `Mcp-Session-Id` (claude-code#41836), então itens 3–4 são o agrupador prático.
+- **Distributed-trace linking**: com `traceparent` presente, o span é aberto com `trace_context={trace_id, parent_span_id}` (`_parse_traceparent`), aninhando o span do gateway sob o trace do cliente — todos os spans de um trace renderizam juntos.
+- `tags = ["mcp", <server>, <client_label>]` (`_client_label` → `claude` quando `user-agent` começa com `Claude`).
+- `metadata`: `mcp.server`, `mcp.method`, `mcp.tool_name`, `mcp.jsonrpc_id`, `mcp.protocol_version`, `client.user_agent`, `w3c.traceparent`, `w3c.baggage`, `path`, `http_method`, `status_code`.
 - `input.body` e `output` carregam o payload bruto da request e a resposta (incluindo SSE quando streaming).
 
 `LANGFUSE_ENABLED` é `True` somente com `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` + SDK instalado. Sem isso, `_start_mcp_span` é no-op.
@@ -1233,7 +1293,7 @@ curl -X POST http://localhost:4000/key/delete \
 | Sintoma | Causa provável | Diagnóstico |
 |---|---|---|
 | `401 unauthorized` em `/mcp/*` com `WWW-Authenticate` | Bearer expirado, ou refresh Linear falhou | `redis-cli ... GET mcp:bearer:<bearer>` retorna `(nil)` |
-| `403 forbidden linear_mcp not permitted for this key` | Virtual key não tem `linear_mcp` no `object_permission` do Team/User/Key | `curl /v1/mcp/server` com a key — `linear_mcp` ausente da resposta |
+| Conector conecta mas `tools/list` vem vazio | MCP (ex.: `linear_mcp`/`deepwiki_mcp`) fora do `object_permission` do Team/User/Key → `_restricted_mcp_response` | `curl /v1/mcp/server` com a key — MCP ausente da resposta. Conceder no admin e aguardar ≤30s (`MCP_PERM_TTL`) |
 | `400 invalid_grant` em `/v1/mcp/oauth/token` | PKCE não bate, code já foi consumido, ou TTL de 300s expirou | Cliente provavelmente regenerou o `code_verifier` entre authorize e token |
 | `400 invalid_redirect_uri` | `redirect_uri` fora da allow-list `ALLOWED_REDIRECT_PREFIXES` | Editar `.env` e reiniciar gateway |
 | Tela de consent mostra `MCP genérico` em vez do alias | Cliente não enviou `resource` na URL, ou alias não está em `MCP_AUTH_REGISTRY` | Inspecionar URL do authorize: deve conter `&resource=https://<gateway>/mcp/<alias>` |
@@ -1241,7 +1301,8 @@ curl -X POST http://localhost:4000/key/delete \
 | `400 provider_mismatch: 'X'` no `/v1/linear/callback` | Sessão Redis foi criada para outro provider, mas Claude bateu no callback Linear | Bug interno: cliente forjando state, ou novo provider sem callback dedicado |
 | `400 session_expired` no callback OAuth | Demorou mais de 600s no authorize do provider; ou container reiniciou | Aumentar `SESSION_TTL` no código, ou refazer o fluxo |
 | Linear retorna `invalid_redirect_uri` | `LINEAR_REDIRECT_URI` no `.env` ≠ valor cadastrado no app Linear | Conferir caractere por caractere, inclusive trailing slash |
-| 403 do LiteLLM em `/mcp/deepwiki` | `allowed_routes` não inclui `mcp_routes`, ou `deepwiki_mcp` fora do `object_permission` | Conferir Team/User/Key no admin UI |
+| `deepwiki` conecta mas sem tools | `deepwiki_mcp` fora do `object_permission` (gate `_restricted_mcp_response`) | Conceder `deepwiki_mcp` ao Team/User/Key no admin UI; refresh após ≤30s |
+| 403 do LiteLLM em `/mcp/deepwiki` (quando JÁ no escopo) | `allowed_routes` não inclui `mcp_routes` | Conferir Team/User/Key no admin UI |
 
 ### 10.8 Logs
 
