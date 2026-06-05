@@ -1,15 +1,22 @@
 # Services:
-#   - LiteLLM Proxy     (LLM gateway)         -> :4000
+#   - APISIX            (edge gateway)        -> :9080
+#   - MCP Gateway       (OAuth shim + authz)  -> :9100
+#   - LiteLLM Proxy     (LLM/MCP gateway)     -> :4000
+#   - OpenFGA           (authorization)       -> :8080 / :8081
 #   - Langfuse Web      (observability UI)    -> :3000
 #   - Langfuse Worker   (async processing)
 #   - Presidio Analyzer (PII detection)       -> :5002
 #   - Presidio Anonymizer (PII masking)       -> :5001
 #   - PostgreSQL        (shared OLTP)         -> :5432
+#   - Postgres Init     (create langfuse/openfga DBs)
 #   - ClickHouse        (Langfuse OLAP)       -> :8123
 #   - Redis             (cache / queue)       -> :6379
 #   - MinIO             (S3-compatible blob)  -> :9000 / :9090
 #   - MinIO Init        (bucket creation)
-#   - MCP Gateway       (OAuth shim)          -> :9100
+#
+# Edge → shim → control plane:
+#   client → APISIX :9080 → mcp-gateway :9100 → LiteLLM :4000 → upstream MCPs
+#   authn: cmp_* bearer → virtual key  |  authz: OpenFGA (team → mcp)
 networks:
   llmops:
     driver: bridge
@@ -136,6 +143,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
       redis:
@@ -205,6 +214,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
       redis:
@@ -288,7 +299,7 @@ services:
           memory: 768M
 
   litellm:
-    image: ghcr.io/berriai/litellm:v1.85.0
+    image: ghcr.io/berriai/litellm:v1.87.0
     restart: unless-stopped
     networks: [llmops]
     ports:
@@ -311,11 +322,27 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       REDIS_AUTH: ${REDIS_AUTH}
+      # Upstream MCP OAuth credentials live HERE now (config.yaml mcp_servers
+      # linear_mcp auth_type: oauth2), not in the gateway. Optional/blank ok.
+      LINEAR_OAUTH_CLIENT_ID: ${LINEAR_OAUTH_CLIENT_ID:-}
+      LINEAR_OAUTH_CLIENT_SECRET: ${LINEAR_OAUTH_CLIENT_SECRET:-}
       PRESIDIO_ANALYZER_API_BASE: http://presidio-analyzer:3000
       PRESIDIO_ANONYMIZER_API_BASE: http://presidio-anonymizer:3000
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
       LANGFUSE_HOST: http://langfuse-web:3000
+      # Public origin LiteLLM uses to build the MCP OAuth redirect_uri
+      # (<PROXY_BASE_URL>/ui/mcp/oauth/callback). Set to the ngrok https URL
+      # when exposing :4000 publicly for the native-OAuth Linear MCP test.
+      PROXY_BASE_URL: ${PROXY_BASE_URL:-http://localhost:4000}
+      # ngrok terminates TLS and forwards plain http to :4000; trust its
+      # X-Forwarded-Proto so uvicorn reports https and the OAuth discovery
+      # issuer/endpoints are emitted as https (LiteLLM issue #15719).
+      FORWARDED_ALLOW_IPS: "*"
+      # Allow external MCP OAuth clients (Claude) whose redirect_uri origin
+      # differs from the proxy origin. Without this LiteLLM 400s the claude.ai
+      # callback ("redirect_uri origin does not match the proxy origin").
+      MCP_TRUSTED_REDIRECT_ORIGINS: ${MCP_TRUSTED_REDIRECT_ORIGINS:-claude.ai,claude.com}
     command:
       - "--config"
       - "/app/config.yaml"
@@ -349,17 +376,21 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      openfga:
+        condition: service_healthy
     environment:
       LITELLM_BASE_URL: http://litellm:4000
+      # Required: resolves virtual key -> user email (the OpenFGA authz subject).
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       PUBLIC_BASE_URL: ${MCP_GATEWAY_PUBLIC_URL}
       ALLOWED_REDIRECT_PREFIXES: ${MCP_ALLOWED_REDIRECT_PREFIXES:-https://claude.ai/,https://claude.com/,http://localhost,http://127.0.0.1}
       REDIS_URL: redis://:${REDIS_AUTH}@redis:6379/2
       MCP_BEARER_TTL: ${MCP_BEARER_TTL:-2592000}
-      LINEAR_OAUTH_CLIENT_ID: ${LINEAR_OAUTH_CLIENT_ID:-}
-      LINEAR_OAUTH_CLIENT_SECRET: ${LINEAR_OAUTH_CLIENT_SECRET:-}
-      LINEAR_REDIRECT_URI: ${LINEAR_REDIRECT_URI:-}
-      LINEAR_OAUTH_SCOPES: ${LINEAR_OAUTH_SCOPES:-read,write,issues:create,comments:create}
+      # Authorization engine. Store/model ids resolved by name at startup.
+      OPENFGA_API_URL: http://openfga:8080
+      OPENFGA_STORE_NAME: ${OPENFGA_STORE_NAME:-llmops}
+      OPENFGA_STORE_ID: ${OPENFGA_STORE_ID:-}
+      OPENFGA_MODEL_ID: ${OPENFGA_MODEL_ID:-}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
       LANGFUSE_HOST: http://langfuse-web:3000
@@ -373,4 +404,125 @@ services:
       resources:
         limits:
           memory: 256M
+
+  # Creates the langfuse + openfga databases on the shared Postgres instance
+  # (POSTGRES_DB only creates litellm). Idempotent: skips existing DBs.
+  postgres-init:
+    image: postgres:16-alpine
+    networks: [llmops]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      LANGFUSE_DB: ${LANGFUSE_DB:-langfuse}
+      OPENFGA_DB: ${OPENFGA_DB:-openfga}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        for db in "$${LANGFUSE_DB}" "$${OPENFGA_DB}"; do
+          if psql -tc "SELECT 1 FROM pg_database WHERE datname='$$db'" | grep -q 1; then
+            echo "postgres-init: db $$db exists"
+          else
+            createdb "$$db" && echo "postgres-init: created db $$db"
+          fi
+        done
+        echo "postgres-init: done"
+    restart: "no"
+
+  # OpenFGA schema migration (one-shot). Creates tables; the openfga DB itself
+  # must already exist (postgres-init).
+  openfga-migrate:
+    image: openfga/openfga:v1.8
+    networks: [llmops]
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${OPENFGA_DB:-openfga}?sslmode=disable
+    command: migrate
+    restart: "no"
+
+  # OpenFGA authorization server (Zanzibar-style ReBAC). Source of truth for
+  # which MCPs a team/user may access.
+  openfga:
+    image: openfga/openfga:v1.8
+    restart: unless-stopped
+    networks: [llmops]
+    ports:
+      - "8080:8080"   # HTTP API (gateway calls /stores/{id}/check)
+      - "8081:8081"   # gRPC (health probe)
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${OPENFGA_DB:-openfga}?sslmode=disable
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_LOG_FORMAT: json
+    command: run
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=127.0.0.1:8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # One-shot: create store + upload model + seed example tuples via the HTTP API
+  # (idempotent — skips if a store named OPENFGA_STORE_NAME already exists).
+  openfga-bootstrap:
+    image: curlimages/curl:latest
+    networks: [llmops]
+    depends_on:
+      openfga:
+        condition: service_healthy
+    volumes:
+      - ./openfga:/work:ro
+    environment:
+      OPENFGA_API_URL: http://openfga:8080
+      OPENFGA_STORE_NAME: ${OPENFGA_STORE_NAME:-llmops}
+    entrypoint: ["sh", "/work/bootstrap.sh"]
+    restart: "no"
+
+  # Edge gateway (standalone, HTTP only). A tunnel (ngrok/tailscale) terminates
+  # TLS and forwards plain HTTP here — keeping the SSE hop on HTTP avoids APISIX
+  # bug #12665. Point the public tunnel at this :9080, NOT mcp-gateway:9100.
+  apisix:
+    image: apache/apisix:3.13.0-debian
+    restart: unless-stopped
+    networks: [llmops]
+    ports:
+      - "9080:9080"
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./apisix/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+    environment:
+      # Injected into apisix.yaml via ${{REDIS_AUTH}} for the limit-count plugin.
+      REDIS_AUTH: ${REDIS_AUTH}
+    depends_on:
+      mcp-gateway:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # The apisix:debian image ships no curl/wget; use openresty's resty for a
+      # TCP liveness probe on the data-plane port.
+      test: ["CMD", "resty", "-e", "local s=ngx.socket.tcp(); local ok=s:connect('127.0.0.1',9080); if not ok then os.exit(1) end; s:close()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 

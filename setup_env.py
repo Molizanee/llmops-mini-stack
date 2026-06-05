@@ -79,6 +79,21 @@ def main() -> None:
     custom_pw = input("  Press Enter to accept, or type a custom password: ").strip()
     langfuse_admin_password = custom_pw if custom_pw else default_admin_pw
 
+    print("\n─── MCP Gateway / Edge ────────────────────────────────────────────")
+    print("  Public URL clients use to reach the stack. APISIX (:9080) is the")
+    print("  entry point; a tunnel (ngrok/tailscale) terminates TLS in front.\n")
+    mcp_public_url = prompt_input("  Public base URL", default="http://localhost:9080")
+
+    print("\n─── Linear MCP upstream OAuth (optional) ──────────────────────────")
+    print("  Used by LiteLLM (config.yaml linear_mcp auth_type: oauth2). Leave")
+    print("  blank to skip. NOTE: blocked by upstream bug #26700 until fixed.\n")
+    linear_client_id = prompt_input("  Linear OAuth client id", default="")
+    linear_client_secret = (
+        prompt_secret("  Linear OAuth client secret: ", allow_empty=True)
+        if linear_client_id
+        else ""
+    )
+
     print("\n─── Generating secrets ────────────────────────────────────────────")
 
     litellm_master_key = f"sk-{generate_hex(32)}"
@@ -184,6 +199,27 @@ LANGFUSE_INIT_PROJECT_SECRET_KEY={langfuse_secret_key}
 LANGFUSE_INIT_USER_EMAIL={langfuse_admin_email}
 LANGFUSE_INIT_USER_NAME={langfuse_admin_name}
 LANGFUSE_INIT_USER_PASSWORD={langfuse_admin_password}
+
+# ---------------------------------------------------------------------------
+# MCP Gateway (slim OAuth shim) — authn: cmp_* -> virtual key
+# ---------------------------------------------------------------------------
+# Public URL the AI client uses. The tunnel points at APISIX :9080, not :9100.
+MCP_GATEWAY_PUBLIC_URL={mcp_public_url}
+MCP_ALLOWED_REDIRECT_PREFIXES=https://claude.ai/,https://claude.com/,http://localhost,http://127.0.0.1
+MCP_BEARER_TTL=2592000
+MCP_EMAIL_TTL=3600
+
+# ---------------------------------------------------------------------------
+# OpenFGA (authorization: team -> mcp)
+# ---------------------------------------------------------------------------
+OPENFGA_DB=openfga
+OPENFGA_STORE_NAME=llmops
+
+# ---------------------------------------------------------------------------
+# Linear MCP upstream OAuth (consumed by LiteLLM, not the gateway)
+# ---------------------------------------------------------------------------
+LINEAR_OAUTH_CLIENT_ID={linear_client_id}
+LINEAR_OAUTH_CLIENT_SECRET={linear_client_secret}
 """
 
     # --- Write .env file ---

@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.1",
+  "type_definitions": [
+    {
+      "type": "user",
+      "relations": {},
+      "metadata": null
+    },
+    {
+      "type": "team",
+      "relations": {
+        "member": { "this": {} }
+      },
+      "metadata": {
+        "relations": {
+          "member": {
+            "directly_related_user_types": [{ "type": "user" }]
+          }
+        }
+      }
+    },
+    {
+      "type": "mcp",
+      "relations": {
+        "enabled_team": { "this": {} },
+        "can_access": {
+          "tupleToUserset": {
+            "tupleset": { "relation": "enabled_team" },
+            "computedUserset": { "relation": "member" }
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "enabled_team": {
+            "directly_related_user_types": [{ "type": "team" }]
+          },
+          "can_access": {
+            "directly_related_user_types": []
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+# OpenFGA authorization model (human-readable DSL — source of truth).
+# The gateway checks: user:<email> can_access mcp:<server_name>
+#
+# A user can_access an MCP iff they are a member of a team that has the MCP
+# enabled. Mirror these object ids with litellm/config.yaml mcp_servers names
+# and the gateway's _server_from_path (linear_mcp, deepwiki_mcp).
+#
+# The bootstrap uploads model.json (the API/JSON form of THIS model). When you
+# edit the model, regenerate model.json with:  fga model transform --file model.fga
+model
+  schema 1.1
+
+type user
+
+type team
+  relations
+    define member: [user]
+
+type mcp
+  relations
+    define enabled_team: [team]
+    define can_access: member from enabled_team

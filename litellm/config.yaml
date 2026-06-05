@@ -51,12 +51,22 @@ litellm_settings:
     "deep_wiki": "deepwiki_mcp"
     "linear": "linear_mcp"
 
+# All MCP connections + all upstream MCP auth live here (single source). The
+# mcp-gateway is a slim shim: it never connects to an MCP directly.
 mcp_servers:
   deepwiki_mcp:
     url: "https://mcp.deepwiki.com/mcp"
+  # Linear via LiteLLM-native OAuth2 (no gateway-side Linear OAuth anymore).
+  # v1.87 proxies streamable-http MCP fine (verified: deepwiki tools/list +
+  # Linear OAuth authorize); the v1.85 #26700 cancel-scope bug no longer fires.
   linear_mcp:
     url: "https://mcp.linear.app/mcp"
-    extra_headers: ["authorization"]
+    auth_type: "oauth2"
+    authorization_url: "https://linear.app/oauth/authorize"
+    token_url: "https://api.linear.app/oauth/token"
+    client_id: os.environ/LINEAR_OAUTH_CLIENT_ID
+    client_secret: os.environ/LINEAR_OAUTH_CLIENT_SECRET
+    scopes: ["read", "write", "issues:create", "comments:create"]
 
 guardrails:
   - guardrail_name: "presidio-pii"

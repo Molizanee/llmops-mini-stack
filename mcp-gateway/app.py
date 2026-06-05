@@ -1,32 +1,36 @@
-"""MCP OAuth 2.1 compound-token shim in front of LiteLLM.
+"""Slim MCP OAuth 2.1 shim in front of LiteLLM.
 
-Issues opaque compound bearers that bind a LiteLLM virtual key with
-optional per-user Linear OAuth tokens. Claude Desktop sees ONE OAuth
-issuer (this shim) and ONE access_token. Server-side, every /mcp/*
-request is split into:
+Two jobs only:
 
-  - x-litellm-api-key: Bearer <virtual_key>      (LiteLLM platform auth)
-  - x-mcp-linear-authorization: Bearer <linear>  (per-user Linear OAuth)
+  1. AUTHENTICATE the AI client. The shim is an OAuth 2.1 Authorization Server
+     (DCR, PKCE S256, .well-known) that mints an opaque bearer `cmp_*` bound to
+     a single LiteLLM virtual key. Claude Desktop sees ONE issuer (this shim)
+     and ONE access_token.
+  2. AUTHORIZE which MCP servers the caller may use. Decision comes from OpenFGA
+     (ReBAC): `user:<email> can_access mcp:<server>`, where <email> is resolved
+     from the virtual key via LiteLLM /key/info → /user/info.
+
+The shim holds NO direct MCP connections and NO upstream OAuth. Every /mcp/*
+request is forwarded to LiteLLM with `x-litellm-api-key: Bearer <virtual_key>`.
+All MCP connections and all upstream MCP auth (incl. OAuth, auth_type: oauth2)
+live in LiteLLM config.
 
 Authorize flow:
-  1. /v1/mcp/oauth/authorize (GET)  → consent form (virtual key + optional Linear toggle)
-  2. /v1/mcp/oauth/authorize (POST) → if Linear requested, 302 to Linear authorize;
-                                       otherwise mint auth code and 302 back to client
-  3. /v1/linear/callback            → exchange Linear code → store binding → 302 to client
-  4. /v1/mcp/oauth/token (POST)     → PKCE verify, mint opaque compound bearer
+  1. /v1/mcp/oauth/authorize (GET)  → consent form (paste virtual key)
+  2. /v1/mcp/oauth/authorize (POST) → mint auth code, 302 back to client
+  3. /v1/mcp/oauth/token (POST)     → PKCE verify, mint opaque bearer `cmp_*`
 
 Storage:
-  - Redis-backed (sessions, codes, bearers). Survives shim restart.
+  - Redis-backed (codes, bearers). Survives shim restart.
 
 Token lifecycle:
-  - Linear access_token TTL is 24h. Shim auto-refreshes on /mcp/* when within
-    REFRESH_LEAD seconds of expiry. Linear rotates refresh_tokens.
-  - Compound bearer TTL is BEARER_TTL (default 30 days). Independent of Linear
-    rotation because shim refreshes Linear in-place under the same bearer.
+  - Bearer TTL is BEARER_TTL (default 30 days). The binding holds only the
+    virtual key + resolved user email; no upstream tokens to refresh.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import html
@@ -52,44 +56,17 @@ LITELLM_BASE = os.environ["LITELLM_BASE_URL"].rstrip("/")
 PUBLIC_BASE = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 REDIS_URL = os.environ["REDIS_URL"]
 # Admin key for resolving a virtual key -> owning user email via /key/info.
-# Optional: without it, traces fall back to a hashed key id instead of email.
+# Effectively REQUIRED: the resolved email is the OpenFGA authz subject. Without
+# it, _resolve_user_email returns "" and every Check fails closed (all MCPs hidden).
 LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 
-LINEAR_CLIENT_ID = os.environ.get("LINEAR_OAUTH_CLIENT_ID", "")
-LINEAR_CLIENT_SECRET = os.environ.get("LINEAR_OAUTH_CLIENT_SECRET", "")
-LINEAR_AUTHORIZE_URL = os.environ.get(
-    "LINEAR_AUTHORIZE_URL", "https://linear.app/oauth/authorize"
-)
-LINEAR_TOKEN_URL = os.environ.get(
-    "LINEAR_TOKEN_URL", "https://api.linear.app/oauth/token"
-)
-LINEAR_REVOKE_URL = os.environ.get(
-    "LINEAR_REVOKE_URL", "https://api.linear.app/oauth/revoke"
-)
-LINEAR_REDIRECT_URI = os.environ.get("LINEAR_REDIRECT_URI", "")
-LINEAR_SCOPES = os.environ.get(
-    "LINEAR_OAUTH_SCOPES", "read,write,issues:create,comments:create"
-)
-LINEAR_ENABLED = bool(LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET and LINEAR_REDIRECT_URI)
-
-OAUTH_PROVIDERS: dict[str, dict[str, Any]] = {}
-if LINEAR_ENABLED:
-    OAUTH_PROVIDERS["linear"] = {
-        "authorize_url": LINEAR_AUTHORIZE_URL,
-        "client_id": LINEAR_CLIENT_ID,
-        "redirect_uri": LINEAR_REDIRECT_URI,
-        "scopes": LINEAR_SCOPES,
-        "extra_params": {"actor": "user"},
-    }
-
-# Mirrors LiteLLM's mcp_servers in litellm/config.yaml. Each alias maps to
-# its auth requirement. "oauth" entries point to an OAUTH_PROVIDERS key.
-# Adding a new MCP: add a row here. Adding a new OAuth provider: add a row
-# above + a callback handler below.
-MCP_AUTH_REGISTRY: dict[str, dict[str, str]] = {
-    "linear_mcp": {"auth_type": "oauth", "provider": "linear"},
-    "deepwiki_mcp": {"auth_type": "none"},
-}
+# OpenFGA (authorization). The shim resolves the store by name at startup unless
+# OPENFGA_STORE_ID is pinned via env; OPENFGA_MODEL_ID falls back to the latest.
+OPENFGA_API_URL = os.environ.get("OPENFGA_API_URL", "").rstrip("/")
+OPENFGA_STORE_NAME = os.environ.get("OPENFGA_STORE_NAME", "llmops")
+OPENFGA_STORE_ID = os.environ.get("OPENFGA_STORE_ID", "")
+OPENFGA_MODEL_ID = os.environ.get("OPENFGA_MODEL_ID", "")
+OPENFGA_ENABLED = bool(OPENFGA_API_URL)
 
 ALLOWED_REDIRECT_PREFIXES = [
     p.strip()
@@ -100,12 +77,9 @@ ALLOWED_REDIRECT_PREFIXES = [
     if p.strip()
 ]
 
-SESSION_TTL = 600
 AUTH_CODE_TTL = 300
 BEARER_TTL = int(os.environ.get("MCP_BEARER_TTL", str(30 * 24 * 3600)))
-REFRESH_LEAD = 10
 
-K_SESSION = "mcp:session:"
 K_CODE = "mcp:code:"
 K_BEARER = "mcp:bearer:"
 K_EMAIL = "mcp:email:"
@@ -124,15 +98,11 @@ mcp_client = httpx.AsyncClient(
     limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0),
     http2=False,
 )
-linear_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
-# Direct Linear MCP proxy. Bypasses LiteLLM because v1.85.0 cannot proxy
-# streamable-http MCP servers (BerriAI/litellm#26700 — AnyIO cancel-scope
-# bug in upstream MCP Python SDK). Streams SSE; no read timeout.
-LINEAR_MCP_URL = os.environ.get("LINEAR_MCP_URL", "https://mcp.linear.app/mcp")
-linear_mcp_client = httpx.AsyncClient(
-    timeout=httpx.Timeout(None, connect=5.0),
-    limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0),
-    http2=False,
+# OpenFGA Check client (authorization). Plain httpx — one POST /check per call,
+# no SDK needed to stay slim.
+fga_client = httpx.AsyncClient(
+    base_url=OPENFGA_API_URL or "http://openfga:8080",
+    timeout=httpx.Timeout(5.0, connect=2.0),
 )
 r = redis_async.from_url(REDIS_URL, decode_responses=True)
 
@@ -207,7 +177,7 @@ async def health() -> dict[str, bool]:
         await r.ping()
     except Exception as exc:
         raise HTTPException(503, f"redis unreachable: {exc}") from exc
-    return {"ok": True, "linear": LINEAR_ENABLED}
+    return {"ok": True, "openfga": OPENFGA_ENABLED and bool(OPENFGA_STORE_ID)}
 
 
 @app.get("/.well-known/oauth-authorization-server")
@@ -443,9 +413,6 @@ async def _mint_auth_code(
     state: str,
     scope: str,
     api_key: str,
-    linear_access: str = "",
-    linear_refresh: str = "",
-    linear_exp: int = 0,
 ) -> Response:
     code = secrets.token_urlsafe(32)
     await r.setex(
@@ -458,9 +425,6 @@ async def _mint_auth_code(
                 "code_challenge": code_challenge,
                 "scope": scope,
                 "api_key": api_key,
-                "linear_access": linear_access,
-                "linear_refresh": linear_refresh,
-                "linear_exp": linear_exp,
             }
         ),
     )
@@ -490,104 +454,16 @@ async def authorize_post(
     if not api_key.strip():
         raise HTTPException(400, "api_key required")
 
-    # resource carries the URL alias (e.g. "linear", "deepwiki", "deep_wiki");
-    # resolve it to the canonical server name so it matches MCP_AUTH_REGISTRY
-    # keys ("linear_mcp"/"deepwiki_mcp"). Without this, "linear" misses the
-    # registry and falls through to auth_type=none, skipping Linear OAuth.
-    alias = _alias_from_resource(resource)
-    server = _server_from_path("/" + alias) if alias else ""
-    entry = MCP_AUTH_REGISTRY.get(server, {"auth_type": "none"})
-
-    if entry["auth_type"] == "none":
-        return await _mint_auth_code(
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
-            state=state,
-            scope=scope,
-            api_key=api_key.strip(),
-        )
-
-    provider_id = entry.get("provider", "")
-    provider = OAUTH_PROVIDERS.get(provider_id)
-    if not provider:
-        raise HTTPException(400, f"oauth_provider_unavailable: {provider_id}")
-
-    session_id = secrets.token_urlsafe(32)
-    await r.setex(
-        K_SESSION + session_id,
-        SESSION_TTL,
-        json.dumps(
-            {
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "code_challenge": code_challenge,
-                "state": state,
-                "scope": scope,
-                "api_key": api_key.strip(),
-                "provider": provider_id,
-            }
-        ),
-    )
-    params = {
-        "client_id": provider["client_id"],
-        "redirect_uri": provider["redirect_uri"],
-        "response_type": "code",
-        "scope": provider["scopes"],
-        "state": session_id,
-        **provider.get("extra_params", {}),
-    }
-    return Response(
-        status_code=302,
-        headers={"Location": f"{provider['authorize_url']}?{urlencode(params)}"},
-    )
-
-
-@app.get("/v1/linear/callback")
-async def linear_callback(
-    code: str = "", state: str = "", error: str = "", error_description: str = ""
-) -> Response:
-    if error:
-        raise HTTPException(400, f"linear_error: {error} {error_description}")
-    if not state or not code:
-        raise HTTPException(400, "missing code or state")
-
-    raw = await r.get(K_SESSION + state)
-    if not raw:
-        raise HTTPException(400, "session_expired")
-    await r.delete(K_SESSION + state)
-    sess = json.loads(raw)
-
-    if sess.get("provider") != "linear":
-        raise HTTPException(400, f"provider_mismatch: {sess.get('provider')!r}")
-
-    tok_resp = await linear_client.post(
-        LINEAR_TOKEN_URL,
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": LINEAR_REDIRECT_URI,
-            "client_id": LINEAR_CLIENT_ID,
-            "client_secret": LINEAR_CLIENT_SECRET,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if tok_resp.status_code != 200:
-        raise HTTPException(
-            400, f"linear_token_exchange_failed: {tok_resp.status_code} {tok_resp.text}"
-        )
-    tok = tok_resp.json()
-
+    # No upstream OAuth hop: the shim binds only the virtual key. Per-MCP
+    # upstream auth (incl. OAuth) is handled by LiteLLM. The `resource` form
+    # field is still posted by the consent page but is unused here.
     return await _mint_auth_code(
-        client_id=sess["client_id"],
-        redirect_uri=sess["redirect_uri"],
-        code_challenge=sess["code_challenge"],
-        state=sess.get("state", ""),
-        scope=sess.get("scope", ""),
-        api_key=sess["api_key"],
-        linear_access=tok["access_token"],
-        linear_refresh=tok.get("refresh_token", ""),
-        linear_exp=int(time.time()) + int(tok.get("expires_in", 3600)),
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        state=state,
+        scope=scope,
+        api_key=api_key.strip(),
     )
 
 
@@ -626,9 +502,6 @@ async def token(
             {
                 "api_key": rec["api_key"],
                 "user_email": user_email,
-                "linear_access": rec.get("linear_access", ""),
-                "linear_refresh": rec.get("linear_refresh", ""),
-                "linear_exp": int(rec.get("linear_exp", 0)),
             }
         ),
     )
@@ -646,24 +519,7 @@ async def token(
 
 @app.post("/v1/mcp/oauth/revoke")
 async def revoke(token: str = Form(...)) -> Response:
-    raw = await r.get(K_BEARER + token)
-    if raw:
-        bind = json.loads(raw)
-        rt = bind.get("linear_refresh")
-        if rt:
-            try:
-                await linear_client.post(
-                    LINEAR_REVOKE_URL,
-                    data={
-                        "client_id": LINEAR_CLIENT_ID,
-                        "client_secret": LINEAR_CLIENT_SECRET,
-                        "token": rt,
-                    },
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                )
-            except httpx.HTTPError:
-                pass
-        await r.delete(K_BEARER + token)
+    await r.delete(K_BEARER + token)
     return Response(status_code=200, headers=TOKEN_NO_CACHE)
 
 
@@ -671,29 +527,71 @@ MCP_PERM_TTL = int(os.environ.get("MCP_PERM_TTL", "10"))
 K_PERM = "mcp:perm:"
 
 
-async def _key_has_mcp(api_key: str, server: str) -> bool:
-    cache_key = f"{K_PERM}{api_key}:{server}"
+async def _resolve_openfga() -> None:
+    """Resolve the OpenFGA store/model ids at startup.
+
+    If OPENFGA_STORE_ID is pinned via env, keep it; otherwise look the store up
+    by OPENFGA_STORE_NAME. Pick the latest authorization model when
+    OPENFGA_MODEL_ID is empty. Retries until OpenFGA is reachable (the bootstrap
+    one-shot may still be importing the store on first boot).
+    """
+    global OPENFGA_STORE_ID, OPENFGA_MODEL_ID
+    if not OPENFGA_ENABLED:
+        return
+    for _ in range(30):
+        try:
+            if not OPENFGA_STORE_ID:
+                resp = await fga_client.get("/stores")
+                if resp.status_code == 200:
+                    for s in resp.json().get("stores", []):
+                        if s.get("name") == OPENFGA_STORE_NAME:
+                            OPENFGA_STORE_ID = s.get("id", "")
+                            break
+            if OPENFGA_STORE_ID and not OPENFGA_MODEL_ID:
+                mresp = await fga_client.get(
+                    f"/stores/{OPENFGA_STORE_ID}/authorization-models",
+                    params={"page_size": 1},
+                )
+                if mresp.status_code == 200:
+                    models = mresp.json().get("authorization_models", [])
+                    if models:
+                        OPENFGA_MODEL_ID = models[0].get("id", "")
+            if OPENFGA_STORE_ID:
+                return
+        except httpx.HTTPError:
+            pass
+        await asyncio.sleep(2)
+
+
+async def _can_access_mcp(user_email: str, server: str) -> bool:
+    """Authorize via OpenFGA: user:<email> can_access mcp:<server>.
+
+    Fails closed on any error / missing identity / unresolved store. Cached in
+    Redis (MCP_PERM_TTL) keyed on the resolved email, so revoking a team→mcp
+    tuple takes effect within one cache window.
+    """
+    if not user_email or not server:
+        return False
+    if not OPENFGA_ENABLED or not OPENFGA_STORE_ID:
+        return False
+    cache_key = f"{K_PERM}{user_email}:{server}"
     cached = await r.get(cache_key)
     if cached is not None:
         return cached == "1"
     allowed = False
+    body: dict[str, Any] = {
+        "tuple_key": {
+            "user": f"user:{user_email}",
+            "relation": "can_access",
+            "object": f"mcp:{server}",
+        },
+    }
+    if OPENFGA_MODEL_ID:
+        body["authorization_model_id"] = OPENFGA_MODEL_ID
     try:
-        resp = await client.get(
-            "/v1/mcp/server",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
+        resp = await fga_client.post(f"/stores/{OPENFGA_STORE_ID}/check", json=body)
         if resp.status_code == 200:
-            data = resp.json()
-            servers = data if isinstance(data, list) else data.get("data", [])
-            names: set[str] = set()
-            for s in servers:
-                if not isinstance(s, dict):
-                    continue
-                for field in ("server_name", "alias", "name", "mcp_server_name"):
-                    v = s.get(field)
-                    if isinstance(v, str):
-                        names.add(v)
-            allowed = server in names
+            allowed = bool(resp.json().get("allowed", False))
     except httpx.HTTPError:
         allowed = False
     await r.setex(cache_key, MCP_PERM_TTL, "1" if allowed else "0")
@@ -800,34 +698,6 @@ def _restricted_mcp_response(parsed: dict[str, Any], server: str) -> Response:
             },
         }
     )
-
-
-async def _refresh_linear(bearer: str, bind: dict[str, Any]) -> dict[str, Any]:
-    rt = bind.get("linear_refresh")
-    if not rt:
-        return bind
-    resp = await linear_client.post(
-        LINEAR_TOKEN_URL,
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": rt,
-            "client_id": LINEAR_CLIENT_ID,
-            "client_secret": LINEAR_CLIENT_SECRET,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if resp.status_code != 200:
-        await r.delete(K_BEARER + bearer)
-        raise HTTPException(401, f"linear_refresh_failed: {resp.status_code}")
-    tok = resp.json()
-    bind = {
-        **bind,
-        "linear_access": tok["access_token"],
-        "linear_refresh": tok.get("refresh_token", rt),
-        "linear_exp": int(time.time()) + int(tok.get("expires_in", 3600)),
-    }
-    await r.setex(K_BEARER + bearer, BEARER_TTL, json.dumps(bind))
-    return bind
 
 
 def _unauth_response(path: str) -> Response:
@@ -1117,40 +987,6 @@ async def _send_with_retry(
         return await client.send(req2, stream=True)
 
 
-async def _proxy_to_linear_direct(
-    request: Request, bind: dict[str, Any], body: bytes, span
-) -> Response:
-    headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in HOP_BY_HOP and k.lower() != "authorization"
-    }
-    headers["authorization"] = f"Bearer {bind['linear_access']}"
-
-    upstream = await _send_with_retry(
-        linear_mcp_client,
-        request.method,
-        LINEAR_MCP_URL,
-        headers=headers,
-        params=request.query_params,
-        content=body,
-    )
-
-    out_headers = {
-        k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP
-    }
-    buf = bytearray()
-    return StreamingResponse(
-        _tee_stream(upstream.aiter_raw(), buf),
-        status_code=upstream.status_code,
-        headers=out_headers,
-        media_type=upstream.headers.get("content-type"),
-        background=BackgroundTask(
-            _make_stream_finalizer(upstream, buf, span, upstream.status_code)
-        ),
-    )
-
-
 @app.api_route(
     "/mcp{path:path}",
     methods=["GET", "POST", "OPTIONS", "DELETE", "PUT", "PATCH", "HEAD"],
@@ -1167,11 +1003,6 @@ async def mcp_proxy(path: str, request: Request) -> Response:
         raw = await r.get(K_BEARER + bearer)
         if raw:
             bind = json.loads(raw)
-            if (
-                bind.get("linear_exp")
-                and bind["linear_exp"] < time.time() + REFRESH_LEAD
-            ):
-                bind = await _refresh_linear(bearer, bind)
 
     api_key = (bind or {}).get("api_key", "")
     email = (bind or {}).get("user_email", "")
@@ -1197,24 +1028,13 @@ async def mcp_proxy(path: str, request: Request) -> Response:
             _end_span_sync(span, status_code=401, output="unauthorized")
             return resp
 
-        is_linear_path = path.startswith("/linear")
-
-        # Linear needs per-user OAuth identity before anything else.
-        if is_linear_path and not bind.get("linear_access"):
-            resp = _unauth_response(path)
-            _end_span_sync(span, status_code=401, output="linear_unauth")
-            return resp
-
-        # Per-server RBAC gate (team/user/key allow-list via LiteLLM
-        # /v1/mcp/server). Not in scope -> do NOT hard-fail: connector
-        # connects, but tools stay hidden until the MCP is granted.
-        if not await _key_has_mcp(bind["api_key"], server):
+        # Per-server authz gate (OpenFGA: user:<email> can_access mcp:<server>).
+        # Not in scope -> do NOT hard-fail: connector connects, but tools stay
+        # hidden until the team is granted the MCP.
+        if not await _can_access_mcp(email, server):
             resp = _restricted_mcp_response(parsed, server)
             _end_span_sync(span, status_code=200, output="restricted")
             return resp
-
-        if is_linear_path:
-            return await _proxy_to_linear_direct(request, bind, body, span)
 
         headers = {
             k: v
@@ -1222,11 +1042,6 @@ async def mcp_proxy(path: str, request: Request) -> Response:
             if k.lower() not in HOP_BY_HOP and k.lower() != "authorization"
         }
         headers["x-litellm-api-key"] = f"Bearer {bind['api_key']}"
-        if bind.get("linear_access"):
-            headers["x-mcp-linear-authorization"] = f"Bearer {bind['linear_access']}"
-            headers["x-mcp-linear_mcp-authorization"] = (
-                f"Bearer {bind['linear_access']}"
-            )
 
         upstream = await _send_with_retry(
             mcp_client,
@@ -1240,6 +1055,8 @@ async def mcp_proxy(path: str, request: Request) -> Response:
         out_headers = {
             k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP
         }
+        # Signal proxies (APISIX/nginx) to stream SSE without buffering.
+        out_headers["X-Accel-Buffering"] = "no"
         buf = bytearray()
         return StreamingResponse(
             _tee_stream(upstream.aiter_raw(), buf),
@@ -1253,6 +1070,14 @@ async def mcp_proxy(path: str, request: Request) -> Response:
     except Exception as exc:
         _end_span_error(span, exc)
         raise
+
+
+@app.on_event("startup")
+async def _bootstrap_openfga() -> None:
+    # Resolve store/model in the background so the app comes up even while the
+    # OpenFGA bootstrap one-shot is still importing the store. Authz fails
+    # closed (restricted) until the store id is known.
+    asyncio.create_task(_resolve_openfga())
 
 
 @app.on_event("shutdown")

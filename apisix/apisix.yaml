@@ -1,0 +1,104 @@
+# APISIX standalone declarative config. Reloaded on file change.
+# MUST end with the literal line:  #END
+#
+# Env substitution: ${{VAR}} (double braces). REDIS_AUTH is exported into the
+# apisix container via docker-compose (apisix.environment).
+#
+# Edge in front of the slim mcp-gateway:9100. It does perimeter concerns only —
+# rate-limit, CORS, X-Forwarded-* — and NEVER touches the client Authorization
+# header, OAuth tokens, RBAC, or traces (those belong to the gateway/LiteLLM).
+
+upstreams:
+  - id: mcp-gateway
+    type: roundrobin
+    scheme: http
+    nodes:
+      "mcp-gateway:9100": 1
+    keepalive_pool:
+      size: 32
+      idle_timeout: 60
+      requests: 1000
+
+routes:
+  # ----------------------------------------------------------------------
+  # (A) OAuth discovery — passthrough. NO auth, NO path rewrite.
+  #     The client discovers the issuer here; any interference breaks the
+  #     handshake before it reaches the gateway.
+  # ----------------------------------------------------------------------
+  - id: gateway-oauth-wellknown
+    uri: /.well-known/*
+    upstream_id: mcp-gateway
+    plugins:
+      proxy-rewrite:
+        headers:
+          set:
+            X-Forwarded-Host: "$http_host"
+            X-Forwarded-Proto: "https"
+            X-Forwarded-For: "$remote_addr"
+      cors:
+        allow_origins: "https://claude.ai,https://claude.com"
+        allow_methods: "GET,POST,OPTIONS"
+        allow_headers: "Authorization,Content-Type,Mcp-Session-Id,traceparent,baggage"
+        max_age: 86400
+
+  # ----------------------------------------------------------------------
+  # (B) OAuth flow — passthrough. NO auth, NO path rewrite (redirect_uri /
+  #     PKCE depend on the exact path). /v1/linear/callback is intentionally
+  #     OMITTED — the gateway no longer does upstream OAuth.
+  # ----------------------------------------------------------------------
+  - id: gateway-oauth-flow
+    uris:
+      - /register
+      - /v1/mcp/oauth/authorize
+      - /v1/mcp/oauth/token
+      - /v1/mcp/oauth/revoke
+    upstream_id: mcp-gateway
+    plugins:
+      proxy-rewrite:
+        headers:
+          set:
+            X-Forwarded-Host: "$http_host"
+            X-Forwarded-Proto: "https"
+            X-Forwarded-For: "$remote_addr"
+      cors:
+        allow_origins: "https://claude.ai,https://claude.com"
+        allow_methods: "GET,POST,OPTIONS"
+        allow_headers: "Authorization,Content-Type,Mcp-Session-Id,traceparent,baggage"
+        max_age: 86400
+
+  # ----------------------------------------------------------------------
+  # (C) Authenticated MCP surface — /mcp*.
+  #     - PRESERVE client Authorization (never set/add/remove it; no auth plugin).
+  #     - set X-Forwarded-* only; do NOT remove traceparent/baggage/Mcp-Session-Id.
+  #     - rate limiting via redis DB 3 (DB 2 = gateway bindings, DB 0 = LiteLLM cache).
+  #     - response buffering is off globally (config.yaml) so SSE streams through.
+  # ----------------------------------------------------------------------
+  - id: gateway-mcp-proxy
+    uri: /mcp*
+    upstream_id: mcp-gateway
+    plugins:
+      proxy-rewrite:
+        headers:
+          set:
+            X-Forwarded-Host: "$http_host"
+            X-Forwarded-Proto: "https"
+            X-Forwarded-For: "$remote_addr"
+      limit-count:
+        count: 600
+        time_window: 60
+        rejected_code: 429
+        key_type: "var"
+        key: "remote_addr"
+        policy: "redis"
+        redis_host: "redis"
+        redis_port: 6379
+        redis_password: "${{REDIS_AUTH}}"
+        redis_database: 3
+      limit-req:
+        rate: 20
+        burst: 40
+        rejected_code: 429
+        key_type: "var"
+        key: "remote_addr"
+
+#END

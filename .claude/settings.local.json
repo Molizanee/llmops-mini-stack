@@ -62,7 +62,12 @@
       "Bash(curl -s -i 'https://maara-ho-0003.tamarin-tyrannosaurus.ts.net/v1/mcp/oauth/authorize?response_type=code&client_id=mcp_zny3uid1k7kxP1dXqLDpog&redirect_uri=https://claude.ai/api/mcp/auth_callback&code_challenge=abc&code_challenge_method=S256&resource=https://maara-ho-0003.tamarin-tyrannosaurus.ts.net/mcp/deepwiki_mcp&state=xyz')",
       "Bash(lsof -nP -iTCP:9100 -sTCP:LISTEN)",
       "Bash(awk '/mcp-gateway:/{f=1} f{print} f&&/^[a-zA-Z]/&&!/mcp-gateway:/{exit}' docker-compose.yaml)",
-      "Bash(curl -s -i __TRACKED_VAR__/.well-known/oauth-authorization-server/mcp/deepwiki_mcp)"
+      "Bash(curl -s -i __TRACKED_VAR__/.well-known/oauth-authorization-server/mcp/deepwiki_mcp)",
+      "Bash(md5 -q litellm/config.yaml)",
+      "Bash(ruby -ryaml -e \"YAML.load_file\\('litellm/config.yaml'\\); puts 'HOST YAML OK'\")",
+      "Bash(PROXY_BASE_URL=https://shivering-plural-wielder.ngrok-free.dev docker compose up -d --force-recreate litellm)",
+      "Bash(curl -s -o /tmp/r1 -w '%{http_code}\\\\n' -X POST https://shivering-plural-wielder.ngrok-free.dev/mcp/linear_mcp_oauth -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"0\"}}}')",
+      "Read(//tmp/**)"
     ]
   }
 }

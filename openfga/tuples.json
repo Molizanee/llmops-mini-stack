@@ -1,0 +1,9 @@
+{
+  "writes": {
+    "tuple_keys": [
+      { "user": "user:admin@example.com", "relation": "member", "object": "team:platform" },
+      { "user": "team:platform", "relation": "enabled_team", "object": "mcp:deepwiki_mcp" },
+      { "user": "team:platform", "relation": "enabled_team", "object": "mcp:linear_mcp" }
+    ]
+  }
+}
